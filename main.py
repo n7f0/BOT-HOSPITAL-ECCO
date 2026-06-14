@@ -20,6 +20,7 @@ from discord.ext import commands, tasks
 # ──────────────────────────────────────────────────────────────
 TOKEN         = os.environ.get("DISCORD_TOKEN")
 PANEL_CHANNEL = int(os.environ.get("PANEL_CHANNEL_ID", "1515846128493658142"))
+RANK_CHANNEL  = int(os.environ.get("RANK_CHANNEL_ID", "1515852084480839850"))   # ← NOVO
 LOGS_CHANNEL  = int(os.environ.get("LOGS_CHANNEL_ID",  "1515846898156834956"))
 DB            = os.environ.get("DB_PATH", "ponto.db")
 BR_TZ         = pytz.timezone("America/Sao_Paulo")
@@ -202,7 +203,7 @@ async def rank_embed() -> discord.Embed:
 
 
 # ──────────────────────────────────────────────────────────────
-#  ATUALIZAR RANKING
+#  ATUALIZAR RANKING (agora no canal específico de ranking)
 # ──────────────────────────────────────────────────────────────
 async def refresh_rank(force: bool = False):
     global _last_update
@@ -215,8 +216,9 @@ async def refresh_rank(force: bool = False):
 
     async with _rank_lock:
         _last_update = time.monotonic()
-        ch = bot.get_channel(PANEL_CHANNEL)
+        ch = bot.get_channel(RANK_CHANNEL)   # ← USAR CANAL DE RANKING
         if not ch:
+            print(f"⚠️ Canal de ranking ({RANK_CHANNEL}) não encontrado.")
             return
         emb = await rank_embed()
         mid = await load_mid("rank")
@@ -440,13 +442,13 @@ async def cmd_meu_ponto(itx: discord.Interaction):
     await itx.response.send_message(embed=e, ephemeral=True)
 
 
-# /rank_horas — Mod
+# /rank_horas — Mod (agora força atualização no canal de ranking)
 @bot.tree.command(name="rank_horas", description="[MOD] Força atualização do ranking de horas")
 @app_commands.default_permissions(manage_messages=True)
 async def cmd_rank(itx: discord.Interaction):
     await itx.response.defer(ephemeral=True)
     await refresh_rank(force=True)
-    await itx.followup.send("✅ Ranking atualizado!", ephemeral=True)
+    await itx.followup.send("✅ Ranking atualizado no canal de ranking!", ephemeral=True)
 
 
 # /fechar_ponto_admin — Admin
@@ -591,27 +593,33 @@ async def on_ready():
     # Registrar a view persistente (necessário para sobreviver a reinicializações)
     bot.add_view(PunchView())
 
-    # Verificar/recriar o painel se necessário
-    ch = bot.get_channel(PANEL_CHANNEL)
-    if ch:
-        mid         = await load_mid("panel")
+    # Verificar/recriar o painel de botões (continua no canal PANEL_CHANNEL)
+    ch_panel = bot.get_channel(PANEL_CHANNEL)
+    if ch_panel:
+        mid_panel = await load_mid("panel")
         needs_panel = True
-        if mid:
+        if mid_panel:
             try:
-                await ch.fetch_message(mid)
+                await ch_panel.fetch_message(mid_panel)
                 needs_panel = False
             except (discord.NotFound, discord.Forbidden):
                 pass
         if needs_panel:
-            msg = await ch.send(embed=panel_embed(), view=PunchView())
+            msg = await ch_panel.send(embed=panel_embed(), view=PunchView())
             await save_mid("panel", msg.id)
             print(f"📋 Painel criado no canal {PANEL_CHANNEL}")
     else:
         print(f"⚠️  Canal do painel ({PANEL_CHANNEL}) não encontrado. "
               f"Verifique se o bot tem acesso e use /setup_ponto.")
 
-    await refresh_rank(force=True)
-    auto_refresh.start()
+    # Garantir que o ranking seja exibido no canal RANK_CHANNEL
+    ch_rank = bot.get_channel(RANK_CHANNEL)
+    if not ch_rank:
+        print(f"⚠️  Canal de ranking ({RANK_CHANNEL}) não encontrado. "
+              f"O ranking não será exibido até que o canal exista e o bot tenha acesso.")
+    else:
+        await refresh_rank(force=True)
+        auto_refresh.start()
 
     try:
         synced = await bot.tree.sync()
