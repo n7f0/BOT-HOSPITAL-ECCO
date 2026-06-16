@@ -8,6 +8,7 @@ import asyncio
 import datetime
 import os
 import time
+import re
 
 import aiosqlite
 import discord
@@ -25,11 +26,16 @@ LOGS_CHANNEL  = int(os.environ.get("LOGS_CHANNEL_ID",  "1515846898156834956"))
 DB            = os.environ.get("DB_PATH", "ponto.db")
 BR_TZ         = pytz.timezone("America/Sao_Paulo")
 
-# IDs autorizados a usar o comando /ajustar_horas
-ALLOWED_REMOVE_IDS = {
-    "1480675269449617525",
-    "1508478383825354892",
-}
+# IDs autorizados para remover horas
+AUTHORIZED_REMOVE_IDS = [1480675269449617525, 1508478383825354892]
+
+# IDs autorizados para ajustar horário  # NOVO
+AUTHORIZED_ADJUST_IDS = [
+    1480675269449617524,
+    1480675269449617521,
+    1480675269449617523,
+    1480675269449617522,
+]
 
 # ──────────────────────────────────────────────────────────────
 #  BOT
@@ -63,19 +69,13 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS active (
                 user_id   TEXT PRIMARY KEY,
                 user_name TEXT NOT NULL,
-                open_time TEXT NOT NULL,
-                last_notify TEXT
+                open_time TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS msg_store (
                 key        TEXT PRIMARY KEY,
                 message_id TEXT NOT NULL
             );
         """)
-        # Adiciona coluna last_notify se não existir (migração)
-        try:
-            await db.execute("ALTER TABLE active ADD COLUMN last_notify TEXT")
-        except aiosqlite.OperationalError:
-            pass
         await db.commit()
 
 
@@ -102,6 +102,23 @@ def hms(sec: float) -> str:
     h, r = divmod(sec, 3600)
     m, s = divmod(r, 60)
     return f"{h:02d}h {m:02d}m {s:02d}s"
+
+
+def parse_datetime_br(text: str) -> datetime.datetime:
+    """Tenta converter string no formato DD/MM/AAAA HH:MM para datetime com timezone BR."""
+    text = text.strip()
+    # Aceita também DD/MM/AAAA HH:MM:SS
+    match = re.match(r"^(\d{2})/(\d{2})/(\d{4})\s+(\d{2}):(\d{2})(?::(\d{2}))?$", text)
+    if not match:
+        raise ValueError("Formato inválido. Use DD/MM/AAAA HH:MM (ex: 25/12/2025 14:30)")
+    day, month, year, hour, minute, second = match.groups()
+    second = second or "0"
+    dt = datetime.datetime(
+        int(year), int(month), int(day),
+        int(hour), int(minute), int(second)
+    )
+    # Se não tiver timezone, localiza
+    return BR_TZ.localize(dt) if dt.tzinfo is None else dt
 
 
 async def load_mid(key: str):
@@ -215,11 +232,11 @@ async def rank_embed() -> discord.Embed:
 
 
 # ──────────────────────────────────────────────────────────────
-#  ATUALIZAR RANKING (agora no canal específico de ranking)
+#  ATUALIZAR RANKING
 # ──────────────────────────────────────────────────────────────
 async def refresh_rank(force: bool = False):
     global _last_update
-    cooldown = 10  # segundos mínimos entre atualizações
+    cooldown = 10
 
     if not force and (time.monotonic() - _last_update) < cooldown:
         return
@@ -369,38 +386,25 @@ class PunchView(discord.ui.View):
 
 
 # ──────────────────────────────────────────────────────────────
-#  VIEW — NOTIFICAÇÃO POR DM (botões "continuo" / "fechar")
+#  VIEW — NOTIFICAÇÃO POR DM
 # ──────────────────────────────────────────────────────────────
-class NotifyView(discord.ui.View):
+class DMNotifyView(discord.ui.View):
     def __init__(self, user_id: int):
         super().__init__(timeout=3600)  # 1 hora de validade
         self.user_id = user_id
 
-    @discord.ui.button(label="✅ Continuo em serviço", style=discord.ButtonStyle.success)
-    async def keep_btn(self, itx: discord.Interaction, _: discord.ui.Button):
+    @discord.ui.button(label="✅ Ainda em serviço", style=discord.ButtonStyle.success)
+    async def confirm_btn(self, itx: discord.Interaction, _: discord.ui.Button):
         if itx.user.id != self.user_id:
-            return await itx.response.send_message("❌ Esse botão não é para você.", ephemeral=True)
-
-        # Atualiza last_notify para agora, para não incomodar novamente tão cedo
-        now = now_br()
-        async with aiosqlite.connect(DB) as db:
-            await db.execute(
-                "UPDATE active SET last_notify = ? WHERE user_id = ?",
-                (now.isoformat(), str(self.user_id))
-            )
-            await db.commit()
-
-        await itx.response.send_message(
-            "✅ Confirmado! Você continua em serviço. A próxima notificação será daqui a 1 hora.",
-            ephemeral=True
-        )
+            return await itx.response.send_message("❌ Esta mensagem não é para você.", ephemeral=True)
+        await itx.response.send_message("👍 Confirmado! Continuamos contando suas horas.", ephemeral=True)
 
     @discord.ui.button(label="🔴 Fechar Ponto", style=discord.ButtonStyle.danger)
-    async def close_btn(self, itx: discord.Interaction, _: discord.ui.Button):
+    async def close_from_dm_btn(self, itx: discord.Interaction, _: discord.ui.Button):
         if itx.user.id != self.user_id:
-            return await itx.response.send_message("❌ Esse botão não é para você.", ephemeral=True)
+            return await itx.response.send_message("❌ Esta mensagem não é para você.", ephemeral=True)
 
-        uid = str(self.user_id)
+        uid = str(itx.user.id)
         name = itx.user.display_name
         now = now_br()
 
@@ -413,7 +417,7 @@ class NotifyView(discord.ui.View):
 
         open_dt = localize(datetime.datetime.fromisoformat(row[0]))
         dur_sec = int((now - open_dt).total_seconds())
-        ws      = week_monday(open_dt).isoformat()
+        ws = week_monday(open_dt).isoformat()
 
         async with aiosqlite.connect(DB) as db:
             await db.execute(
@@ -425,7 +429,6 @@ class NotifyView(discord.ui.View):
             await db.execute("DELETE FROM active WHERE user_id = ?", (uid,))
             await db.commit()
 
-        # Responde ao usuário
         e = discord.Embed(title="🔴 Ponto Fechado com Sucesso!", color=0xE74C3C)
         e.add_field(name="👤 Colaborador",        value=f"**{name}**",                         inline=False)
         e.add_field(name="🕐 Entrada",             value=open_dt.strftime("%d/%m/%Y às %H:%M:%S"), inline=True)
@@ -433,12 +436,11 @@ class NotifyView(discord.ui.View):
         e.add_field(name="⏱️ Duração da Sessão",   value=f"**{hms(dur_sec)}**",                    inline=False)
         e.set_thumbnail(url=str(itx.user.display_avatar.url))
         e.set_footer(text="ECCO HOSPITAL CENTER • Bate Ponto")
-        await itx.response.send_message(embed=e, ephemeral=True)
+        await itx.response.send_message(embed=e)
 
-        # Log no canal de logs
         lch = bot.get_channel(LOGS_CHANNEL)
         if lch:
-            le = discord.Embed(title="📤 Saída Registrada (via notificação)", color=0xE74C3C, timestamp=now)
+            le = discord.Embed(title="📤 Saída via DM", color=0xE74C3C, timestamp=now)
             le.add_field(name="Colaborador", value=f"{itx.user.mention}\n`{name}`",               inline=True)
             le.add_field(name="Entrada",     value=open_dt.strftime("%d/%m/%Y às %H:%M:%S"),      inline=True)
             le.add_field(name="Saída",       value=now.strftime("%d/%m/%Y às %H:%M:%S"),          inline=True)
@@ -447,85 +449,276 @@ class NotifyView(discord.ui.View):
             await lch.send(embed=le)
 
         asyncio.create_task(refresh_rank())
+        for child in self.children:
+            child.disabled = True
+        await itx.message.edit(view=self)
 
 
 # ──────────────────────────────────────────────────────────────
-#  TASK — NOTIFICAR A CADA 1 HORA QUEM ESTÁ COM PONTO ABERTO
+#  VIEW — REMOVER HORAS
 # ──────────────────────────────────────────────────────────────
-@tasks.loop(minutes=60)
-async def hourly_notify():
-    now = now_br()
-    async with aiosqlite.connect(DB) as db:
-        async with db.execute(
-            "SELECT user_id, user_name, open_time, last_notify FROM active"
-        ) as c:
-            actives = await c.fetchall()
+class RemoveSessionView(discord.ui.View):
+    def __init__(self, user: discord.Member, sessions: list):
+        super().__init__(timeout=120)
+        self.user = user
+        self.sessions = sessions
 
-    for uid, uname, open_time, last_notify in actives:
-        # Se já notificou há menos de 1 hora, pula
-        if last_notify:
-            try:
-                last_dt = localize(datetime.datetime.fromisoformat(last_notify))
-                if (now - last_dt).total_seconds() < 3600:
-                    continue
-            except (ValueError, TypeError):
-                pass
+        options = []
+        for idx, (sid, ot, ct, ds) in enumerate(sessions[:10]):
+            ot_dt = datetime.datetime.fromisoformat(ot)
+            ct_dt = datetime.datetime.fromisoformat(ct) if ct else None
+            label = f"{ot_dt.strftime('%d/%m %H:%M')} → {ct_dt.strftime('%H:%M') if ct_dt else 'aberto'}"
+            value = str(sid)
+            options.append(discord.SelectOption(label=label, value=value, description=f"Duração: {hms(ds or 0)}"))
 
-        # Buscar o membro
-        member = bot.get_user(int(uid))
-        if member is None:
-            # Tenta buscar via API
-            try:
-                member = await bot.fetch_user(int(uid))
-            except discord.NotFound:
-                continue
+        if not options:
+            options.append(discord.SelectOption(label="Nenhuma sessão encontrada", value="none"))
 
-        # Envia DM
-        try:
-            embed = discord.Embed(
-                title="⏰ Verificação de Ponto",
-                description=(
-                    f"Olá **{uname}**!\n\n"
-                    "Você está com o ponto **aberto** há algum tempo.\n"
-                    "**Ainda está em serviço?**\n"
-                    "Clique em **Continuo em serviço** para confirmar, ou **Fechar Ponto** se já encerrou."
-                ),
-                color=0x2ECC71,
+        self.select = discord.ui.Select(placeholder="Selecione a sessão a remover", options=options)
+        self.select.callback = self.select_callback
+        self.add_item(self.select)
+
+    async def select_callback(self, itx: discord.Interaction):
+        if itx.user.id not in AUTHORIZED_REMOVE_IDS:
+            return await itx.response.send_message("❌ Você não tem permissão para remover horas.", ephemeral=True)
+
+        selected = self.select.values[0]
+        if selected == "none":
+            return await itx.response.send_message("Nenhuma sessão disponível.", ephemeral=True)
+
+        sid = int(selected)
+        async with aiosqlite.connect(DB) as db:
+            async with db.execute(
+                "SELECT user_id, open_time, close_time, dur_sec FROM sessions WHERE id = ?",
+                (sid,)
+            ) as c:
+                row = await c.fetchone()
+
+        if not row:
+            return await itx.response.send_message("❌ Sessão não encontrada.", ephemeral=True)
+
+        uid, ot, ct, ds = row
+        if ct is None:
+            return await itx.response.send_message("❌ Não é possível remover uma sessão aberta.", ephemeral=True)
+
+        async with aiosqlite.connect(DB) as db:
+            await db.execute("DELETE FROM sessions WHERE id = ?", (sid,))
+            await db.commit()
+
+        lch = bot.get_channel(LOGS_CHANNEL)
+        if lch:
+            le = discord.Embed(
+                title="🗑️ Sessão Removida por Admin",
+                color=0xFF0000,
+                timestamp=now_br()
             )
-            embed.set_footer(text="ECCO HOSPITAL CENTER • Notificação Automática")
-            view = NotifyView(user_id=int(uid))
-            await member.send(embed=embed, view=view)
+            le.add_field(name="Colaborador", value=f"{self.user.mention} (`{self.user.display_name}`)", inline=True)
+            le.add_field(name="Sessão", value=f"Entrada: {ot}\nSaída: {ct}\nDuração: {hms(ds)}", inline=False)
+            le.add_field(name="Removido por", value=itx.user.mention, inline=True)
+            await lch.send(embed=le)
 
-            # Atualiza last_notify
-            async with aiosqlite.connect(DB) as db:
-                await db.execute(
-                    "UPDATE active SET last_notify = ? WHERE user_id = ?",
-                    (now.isoformat(), uid)
-                )
-                await db.commit()
+        await itx.response.send_message(
+            f"✅ Sessão de **{self.user.display_name}** removida com sucesso!\n"
+            f"Duração: {hms(ds)}",
+            ephemeral=True
+        )
+        asyncio.create_task(refresh_rank(force=True))
 
-            # Log da notificação
-            lch = bot.get_channel(LOGS_CHANNEL)
-            if lch:
-                le = discord.Embed(
-                    title="📨 Notificação enviada",
-                    description=f"Notificação enviada para {member.mention} (`{uname}`)",
-                    color=0x3498DB,
-                    timestamp=now
-                )
-                await lch.send(embed=le)
-
-        except (discord.Forbidden, discord.HTTPException):
-            # Usuário bloqueou DMs ou outro erro
-            continue
+        for child in self.children:
+            child.disabled = True
+        await itx.message.edit(view=self)
 
 
 # ──────────────────────────────────────────────────────────────
-#  TASK — AUTO-REFRESH A CADA 5 MIN
+#  VIEW + MODAL — AJUSTAR HORÁRIO  # NOVO
+# ──────────────────────────────────────────────────────────────
+class AdjustModal(discord.ui.Modal, title="Ajustar Horário da Sessão"):
+    def __init__(self, session_id: int, user: discord.Member):
+        super().__init__()
+        self.session_id = session_id
+        self.user = user
+
+    nova_entrada = discord.ui.TextInput(
+        label="Nova Entrada (DD/MM/AAAA HH:MM)",
+        placeholder="Deixe em branco para não alterar",
+        required=False,
+        max_length=20
+    )
+    nova_saida = discord.ui.TextInput(
+        label="Nova Saída (DD/MM/AAAA HH:MM)",
+        placeholder="Deixe em branco para não alterar",
+        required=False,
+        max_length=20
+    )
+
+    async def on_submit(self, itx: discord.Interaction):
+        # Verificar permissão novamente (segurança)
+        if itx.user.id not in AUTHORIZED_ADJUST_IDS:
+            return await itx.response.send_message("❌ Você não tem permissão.", ephemeral=True)
+
+        # Buscar dados atuais da sessão
+        async with aiosqlite.connect(DB) as db:
+            async with db.execute(
+                "SELECT user_id, open_time, close_time, dur_sec FROM sessions WHERE id = ?",
+                (self.session_id,)
+            ) as c:
+                row = await c.fetchone()
+
+        if not row:
+            return await itx.response.send_message("❌ Sessão não encontrada.", ephemeral=True)
+
+        uid, old_open, old_close, old_dur = row
+        if old_close is None:
+            return await itx.response.send_message("❌ Não é possível ajustar uma sessão aberta.", ephemeral=True)
+
+        # Parse das novas datas
+        new_open = None
+        new_close = None
+
+        if self.nova_entrada.value:
+            try:
+                new_open = parse_datetime_br(self.nova_entrada.value)
+            except ValueError as e:
+                return await itx.response.send_message(f"❌ Erro na nova entrada: {e}", ephemeral=True)
+
+        if self.nova_saida.value:
+            try:
+                new_close = parse_datetime_br(self.nova_saida.value)
+            except ValueError as e:
+                return await itx.response.send_message(f"❌ Erro na nova saída: {e}", ephemeral=True)
+
+        # Se ambos vazios, nada a fazer
+        if not new_open and not new_close:
+            return await itx.response.send_message("ℹ️ Nenhuma alteração fornecida.", ephemeral=True)
+
+        # Validar consistência
+        final_open = new_open if new_open else datetime.datetime.fromisoformat(old_open)
+        final_close = new_close if new_close else datetime.datetime.fromisoformat(old_close)
+
+        # Garantir que ambos têm timezone
+        final_open = localize(final_open)
+        final_close = localize(final_close)
+
+        if final_close <= final_open:
+            return await itx.response.send_message(
+                "❌ A saída deve ser posterior à entrada.", ephemeral=True
+            )
+
+        # Recalcular duração
+        new_dur = int((final_close - final_open).total_seconds())
+
+        # Atualizar no banco
+        async with aiosqlite.connect(DB) as db:
+            await db.execute(
+                "UPDATE sessions SET open_time = ?, close_time = ?, dur_sec = ? WHERE id = ?",
+                (final_open.isoformat(), final_close.isoformat(), new_dur, self.session_id)
+            )
+            await db.commit()
+
+        # Log
+        lch = bot.get_channel(LOGS_CHANNEL)
+        if lch:
+            le = discord.Embed(
+                title="🔄 Horário Ajustado por Admin",
+                color=0x3498DB,
+                timestamp=now_br()
+            )
+            le.add_field(name="Colaborador", value=f"{self.user.mention} (`{self.user.display_name}`)", inline=True)
+            le.add_field(name="Antiga Entrada", value=old_open, inline=True)
+            le.add_field(name="Nova Entrada", value=final_open.strftime("%d/%m/%Y %H:%M:%S"), inline=True)
+            le.add_field(name="Antiga Saída", value=old_close, inline=True)
+            le.add_field(name="Nova Saída", value=final_close.strftime("%d/%m/%Y %H:%M:%S"), inline=True)
+            le.add_field(name="Nova Duração", value=hms(new_dur), inline=True)
+            le.add_field(name="Ajustado por", value=itx.user.mention, inline=True)
+            await lch.send(embed=le)
+
+        await itx.response.send_message(
+            f"✅ Sessão de **{self.user.display_name}** ajustada com sucesso!\n"
+            f"Nova duração: **{hms(new_dur)}**",
+            ephemeral=True
+        )
+        asyncio.create_task(refresh_rank(force=True))
+
+
+class AdjustSessionView(discord.ui.View):
+    def __init__(self, user: discord.Member, sessions: list):
+        super().__init__(timeout=120)
+        self.user = user
+        self.sessions = sessions
+
+        options = []
+        for sid, ot, ct, ds in sessions[:10]:
+            ot_dt = datetime.datetime.fromisoformat(ot)
+            ct_dt = datetime.datetime.fromisoformat(ct) if ct else None
+            label = f"{ot_dt.strftime('%d/%m %H:%M')} → {ct_dt.strftime('%H:%M') if ct_dt else 'aberto'}"
+            value = str(sid)
+            options.append(discord.SelectOption(label=label, value=value, description=f"Duração: {hms(ds or 0)}"))
+
+        if not options:
+            options.append(discord.SelectOption(label="Nenhuma sessão fechada", value="none"))
+
+        self.select = discord.ui.Select(placeholder="Selecione a sessão a ajustar", options=options)
+        self.select.callback = self.select_callback
+        self.add_item(self.select)
+
+    async def select_callback(self, itx: discord.Interaction):
+        if itx.user.id not in AUTHORIZED_ADJUST_IDS:
+            return await itx.response.send_message("❌ Você não tem permissão.", ephemeral=True)
+
+        selected = self.select.values[0]
+        if selected == "none":
+            return await itx.response.send_message("Nenhuma sessão disponível para ajuste.", ephemeral=True)
+
+        sid = int(selected)
+        # Abrir modal
+        modal = AdjustModal(sid, self.user)
+        await itx.response.send_modal(modal)
+
+
+# ──────────────────────────────────────────────────────────────
+#  TASK — AUTO-REFRESH RANKING
 # ──────────────────────────────────────────────────────────────
 @tasks.loop(minutes=5)
 async def auto_refresh():
     await refresh_rank(force=True)
+
+
+# ──────────────────────────────────────────────────────────────
+#  TASK — NOTIFICAÇÕES POR DM
+# ──────────────────────────────────────────────────────────────
+@tasks.loop(hours=1)
+async def notify_active_users():
+    now = now_br()
+    async with aiosqlite.connect(DB) as db:
+        async with db.execute("SELECT user_id, user_name, open_time FROM active") as c:
+            actives = await c.fetchall()
+
+    for uid, uname, ot in actives:
+        user_id = int(uid)
+        user = bot.get_user(user_id)
+        if not user:
+            continue
+        try:
+            embed = discord.Embed(
+                title="⏰ Verificação de Ponto",
+                description=(
+                    f"Olá **{uname}**,\n\n"
+                    "Você ainda está em serviço? Por favor, confirme clicando em um dos botões abaixo.\n"
+                    "Se não estiver mais trabalhando, feche seu ponto imediatamente."
+                ),
+                color=0x3498DB,
+            )
+            open_dt = localize(datetime.datetime.fromisoformat(ot))
+            embed.add_field(
+                name="🕐 Ponto aberto desde",
+                value=f"{open_dt.strftime('%d/%m/%Y às %H:%M:%S')}",
+                inline=False
+            )
+            embed.set_footer(text="ECCO HOSPITAL CENTER • Notificação automática")
+            view = DMNotifyView(user_id)
+            await user.send(embed=embed, view=view)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
 
 
 # ──────────────────────────────────────────────────────────────
@@ -602,7 +795,7 @@ async def cmd_meu_ponto(itx: discord.Interaction):
     await itx.response.send_message(embed=e, ephemeral=True)
 
 
-# /rank_horas — Mod (agora força atualização no canal de ranking)
+# /rank_horas — Mod
 @bot.tree.command(name="rank_horas", description="[MOD] Força atualização do ranking de horas")
 @app_commands.default_permissions(manage_messages=True)
 async def cmd_rank(itx: discord.Interaction):
@@ -743,83 +936,91 @@ async def cmd_pontos_abertos(itx: discord.Interaction):
     await itx.response.send_message(embed=e, ephemeral=True)
 
 
-# ──────────────────────────────────────────────────────────────
-#  /ajustar_horas — Apenas IDs autorizados
-# ──────────────────────────────────────────────────────────────
+# /remover_horas — Apenas IDs autorizados
 @bot.tree.command(
-    name="ajustar_horas",
-    description="[ADMIN] Ajusta horas de um colaborador (positivo adiciona, negativo remove)",
+    name="remover_horas",
+    description="[AUTORIZADO] Remove uma sessão de horas de um colaborador"
 )
-@app_commands.default_permissions(administrator=True)
 @app_commands.describe(
-    colaborador="Colaborador",
-    horas="Horas a adicionar (use negativo para remover, ex: -2.5)",
+    colaborador="Colaborador cuja sessão será removida"
 )
-async def cmd_ajustar_horas(
-    itx: discord.Interaction,
-    colaborador: discord.Member,
-    horas: float,
-):
-    # Verifica se o autor tem permissão pelos IDs
-    if str(itx.user.id) not in ALLOWED_REMOVE_IDS:
+async def cmd_remover_horas(itx: discord.Interaction, colaborador: discord.Member):
+    if itx.user.id not in AUTHORIZED_REMOVE_IDS:
         return await itx.response.send_message(
             "❌ Você não tem permissão para usar este comando.",
             ephemeral=True
         )
 
     uid = str(colaborador.id)
-    segundos = int(horas * 3600)
-
-    if segundos == 0:
-        return await itx.response.send_message("⚠️ O valor informado é zero, nenhuma alteração feita.", ephemeral=True)
+    ws  = week_monday().isoformat()
 
     async with aiosqlite.connect(DB) as db:
-        # Busca a última sessão finalizada do colaborador
         async with db.execute(
-            "SELECT id, dur_sec FROM sessions WHERE user_id = ? AND close_time IS NOT NULL ORDER BY close_time DESC LIMIT 1",
+            "SELECT id, open_time, close_time, dur_sec FROM sessions "
+            "WHERE user_id = ? AND week_start >= ? AND close_time IS NOT NULL "
+            "ORDER BY open_time DESC LIMIT 10",
+            (uid, ws)
+        ) as c:
+            sessions = await c.fetchall()
+
+    if not sessions:
+        return await itx.response.send_message(
+            f"ℹ️ **{colaborador.display_name}** não possui sessões fechadas nesta semana.",
+            ephemeral=True
+        )
+
+    view = RemoveSessionView(colaborador, sessions)
+    embed = discord.Embed(
+        title="🗑️ Remover Sessão de Horas",
+        description=f"Selecione a sessão de **{colaborador.display_name}** que deseja remover.",
+        color=0xFF0000
+    )
+    await itx.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+# ──────────────────────────────────────────────────────────────
+#  /ajustar_horario — Apenas IDs autorizados  # NOVO
+# ──────────────────────────────────────────────────────────────
+@bot.tree.command(
+    name="ajustar_horario",
+    description="[AUTORIZADO] Ajusta a entrada e/ou saída de uma sessão já fechada"
+)
+@app_commands.describe(
+    colaborador="Colaborador cuja sessão será ajustada"
+)
+async def cmd_ajustar_horario(itx: discord.Interaction, colaborador: discord.Member):
+    if itx.user.id not in AUTHORIZED_ADJUST_IDS:
+        return await itx.response.send_message(
+            "❌ Você não tem permissão para usar este comando.",
+            ephemeral=True
+        )
+
+    uid = str(colaborador.id)
+
+    # Buscar últimas 10 sessões fechadas (independente da semana, para flexibilidade)
+    async with aiosqlite.connect(DB) as db:
+        async with db.execute(
+            "SELECT id, open_time, close_time, dur_sec FROM sessions "
+            "WHERE user_id = ? AND close_time IS NOT NULL "
+            "ORDER BY open_time DESC LIMIT 10",
             (uid,)
         ) as c:
-            row = await c.fetchone()
+            sessions = await c.fetchall()
 
-        if not row:
-            return await itx.response.send_message(
-                f"⚠️ **{colaborador.display_name}** não possui sessões finalizadas para ajustar.",
-                ephemeral=True
-            )
-
-        sess_id, dur_atual = row
-        novo_dur = max(0, dur_atual + segundos)
-        if novo_dur == 0 and segundos < 0:
-            # Se a duração zerou, podemos deletar a sessão? Melhor manter com 0.
-            pass
-
-        await db.execute(
-            "UPDATE sessions SET dur_sec = ? WHERE id = ?",
-            (novo_dur, sess_id)
+    if not sessions:
+        return await itx.response.send_message(
+            f"ℹ️ **{colaborador.display_name}** não possui sessões fechadas para ajustar.",
+            ephemeral=True
         )
-        await db.commit()
 
-    # Log
-    lch = bot.get_channel(LOGS_CHANNEL)
-    if lch:
-        le = discord.Embed(
-            title="🔄 Ajuste de Horas",
-            color=0xF1C40F,
-            timestamp=now_br()
-        )
-        le.add_field(name="Colaborador", value=f"{colaborador.mention} (`{colaborador.display_name}`)", inline=True)
-        le.add_field(name="Ajuste", value=f"{horas:+.2f}h", inline=True)
-        le.add_field(name="Nova duração da última sessão", value=f"**{hms(novo_dur)}**", inline=False)
-        le.set_footer(text=f"Executado por {itx.user.display_name}")
-        await lch.send(embed=le)
-
-    await itx.response.send_message(
-        f"✅ Ajuste aplicado para **{colaborador.display_name}**: {horas:+.2f}h.\n"
-        f"Nova duração da última sessão: **{hms(novo_dur)}**",
-        ephemeral=True
+    view = AdjustSessionView(colaborador, sessions)
+    embed = discord.Embed(
+        title="🔄 Ajustar Horário da Sessão",
+        description=f"Selecione a sessão de **{colaborador.display_name}** que deseja ajustar.\n"
+                    "Após selecionar, um modal permitirá alterar entrada e/ou saída.",
+        color=0x3498DB
     )
-
-    asyncio.create_task(refresh_rank())
+    await itx.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -829,10 +1030,8 @@ async def cmd_ajustar_horas(
 async def on_ready():
     await init_db()
 
-    # Registrar a view persistente (necessário para sobreviver a reinicializações)
     bot.add_view(PunchView())
 
-    # Verificar/recriar o painel de botões (continua no canal PANEL_CHANNEL)
     ch_panel = bot.get_channel(PANEL_CHANNEL)
     if ch_panel:
         mid_panel = await load_mid("panel")
@@ -851,7 +1050,6 @@ async def on_ready():
         print(f"⚠️  Canal do painel ({PANEL_CHANNEL}) não encontrado. "
               f"Verifique se o bot tem acesso e use /setup_ponto.")
 
-    # Garantir que o ranking seja exibido no canal RANK_CHANNEL
     ch_rank = bot.get_channel(RANK_CHANNEL)
     if not ch_rank:
         print(f"⚠️  Canal de ranking ({RANK_CHANNEL}) não encontrado. "
@@ -860,8 +1058,7 @@ async def on_ready():
         await refresh_rank(force=True)
         auto_refresh.start()
 
-    # Iniciar a task de notificação a cada hora
-    hourly_notify.start()
+    notify_active_users.start()
 
     try:
         synced = await bot.tree.sync()
