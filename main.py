@@ -26,16 +26,19 @@ LOGS_CHANNEL  = int(os.environ.get("LOGS_CHANNEL_ID",  "1515846898156834956"))
 DB            = os.environ.get("DB_PATH", "ponto.db")
 BR_TZ         = pytz.timezone("America/Sao_Paulo")
 
-# IDs autorizados para remover horas
+# IDs autorizados para remover horas (permanecem)
 AUTHORIZED_REMOVE_IDS = [1480675269449617525, 1508478383825354892]
 
-# IDs autorizados para ajustar horário  # NOVO
+# IDs autorizados para ajustar horário
 AUTHORIZED_ADJUST_IDS = [
     1480675269449617524,
     1480675269449617521,
     1480675269449617523,
     1480675269449617522,
 ]
+
+# Nome do cargo que também pode usar /remover_horas (adicione o cargo exato)
+ALLOWED_ROLE_NAME = "Gestor"   # ← ALTERE AQUI se necessário
 
 # ──────────────────────────────────────────────────────────────
 #  BOT
@@ -105,9 +108,8 @@ def hms(sec: float) -> str:
 
 
 def parse_datetime_br(text: str) -> datetime.datetime:
-    """Tenta converter string no formato DD/MM/AAAA HH:MM para datetime com timezone BR."""
+    """Converte string DD/MM/AAAA HH:MM para datetime com timezone BR."""
     text = text.strip()
-    # Aceita também DD/MM/AAAA HH:MM:SS
     match = re.match(r"^(\d{2})/(\d{2})/(\d{4})\s+(\d{2}):(\d{2})(?::(\d{2}))?$", text)
     if not match:
         raise ValueError("Formato inválido. Use DD/MM/AAAA HH:MM (ex: 25/12/2025 14:30)")
@@ -117,7 +119,6 @@ def parse_datetime_br(text: str) -> datetime.datetime:
         int(year), int(month), int(day),
         int(hour), int(minute), int(second)
     )
-    # Se não tiver timezone, localiza
     return BR_TZ.localize(dt) if dt.tzinfo is None else dt
 
 
@@ -455,82 +456,165 @@ class DMNotifyView(discord.ui.View):
 
 
 # ──────────────────────────────────────────────────────────────
-#  VIEW — REMOVER HORAS
+#  VIEW + MODAL — REMOVER HORAS (NOVA VERSÃO)
 # ──────────────────────────────────────────────────────────────
-class RemoveSessionView(discord.ui.View):
-    def __init__(self, user: discord.Member, sessions: list):
-        super().__init__(timeout=120)
+
+class RemoveHoursModal(discord.ui.Modal, title="Remover Horas da Sessão"):
+    def __init__(self, session_id: int, user: discord.Member):
+        super().__init__()
+        self.session_id = session_id
         self.user = user
-        self.sessions = sessions
 
-        options = []
-        for idx, (sid, ot, ct, ds) in enumerate(sessions[:10]):
-            ot_dt = datetime.datetime.fromisoformat(ot)
-            ct_dt = datetime.datetime.fromisoformat(ct) if ct else None
-            label = f"{ot_dt.strftime('%d/%m %H:%M')} → {ct_dt.strftime('%H:%M') if ct_dt else 'aberto'}"
-            value = str(sid)
-            options.append(discord.SelectOption(label=label, value=value, description=f"Duração: {hms(ds or 0)}"))
+    horas = discord.ui.TextInput(
+        label="Quantas horas remover? (ex: 1.5 ou 2)",
+        placeholder="Digite um número decimal (ex: 1.5 para 1h30)",
+        required=True,
+        max_length=10
+    )
 
-        if not options:
-            options.append(discord.SelectOption(label="Nenhuma sessão encontrada", value="none"))
+    async def on_submit(self, itx: discord.Interaction):
+        # Verifica permissão novamente
+        is_allowed = (
+            itx.user.id in AUTHORIZED_REMOVE_IDS or
+            any(role.name == ALLOWED_ROLE_NAME for role in itx.user.roles)
+        )
+        if not is_allowed:
+            return await itx.response.send_message("❌ Você não tem permissão.", ephemeral=True)
 
-        self.select = discord.ui.Select(placeholder="Selecione a sessão a remover", options=options)
-        self.select.callback = self.select_callback
-        self.add_item(self.select)
+        # Converte horas para segundos
+        try:
+            horas_remover = float(self.horas.value.replace(',', '.'))
+            if horas_remover <= 0:
+                raise ValueError
+        except ValueError:
+            return await itx.response.send_message(
+                "❌ Valor inválido. Digite um número positivo (ex: 1.5).",
+                ephemeral=True
+            )
 
-    async def select_callback(self, itx: discord.Interaction):
-        if itx.user.id not in AUTHORIZED_REMOVE_IDS:
-            return await itx.response.send_message("❌ Você não tem permissão para remover horas.", ephemeral=True)
+        segundos_remover = int(horas_remover * 3600)
 
-        selected = self.select.values[0]
-        if selected == "none":
-            return await itx.response.send_message("Nenhuma sessão disponível.", ephemeral=True)
-
-        sid = int(selected)
+        # Buscar dados atuais da sessão
         async with aiosqlite.connect(DB) as db:
             async with db.execute(
                 "SELECT user_id, open_time, close_time, dur_sec FROM sessions WHERE id = ?",
-                (sid,)
+                (self.session_id,)
             ) as c:
                 row = await c.fetchone()
 
         if not row:
             return await itx.response.send_message("❌ Sessão não encontrada.", ephemeral=True)
 
-        uid, ot, ct, ds = row
-        if ct is None:
-            return await itx.response.send_message("❌ Não é possível remover uma sessão aberta.", ephemeral=True)
+        uid, open_time_str, close_time_str, dur_sec = row
+        if close_time_str is None:
+            return await itx.response.send_message("❌ Não é possível remover horas de uma sessão aberta.", ephemeral=True)
 
-        async with aiosqlite.connect(DB) as db:
-            await db.execute("DELETE FROM sessions WHERE id = ?", (sid,))
-            await db.commit()
-
-        lch = bot.get_channel(LOGS_CHANNEL)
-        if lch:
-            le = discord.Embed(
-                title="🗑️ Sessão Removida por Admin",
-                color=0xFF0000,
-                timestamp=now_br()
+        if dur_sec < segundos_remover:
+            return await itx.response.send_message(
+                f"❌ A sessão tem apenas {hms(dur_sec)}, não é possível remover {hms(segundos_remover)}.",
+                ephemeral=True
             )
-            le.add_field(name="Colaborador", value=f"{self.user.mention} (`{self.user.display_name}`)", inline=True)
-            le.add_field(name="Sessão", value=f"Entrada: {ot}\nSaída: {ct}\nDuração: {hms(ds)}", inline=False)
-            le.add_field(name="Removido por", value=itx.user.mention, inline=True)
-            await lch.send(embed=le)
 
-        await itx.response.send_message(
-            f"✅ Sessão de **{self.user.display_name}** removida com sucesso!\n"
-            f"Duração: {hms(ds)}",
-            ephemeral=True
-        )
+        nova_duracao = dur_sec - segundos_remover
+        open_dt = datetime.datetime.fromisoformat(open_time_str)
+        nova_saida = open_dt + datetime.timedelta(seconds=nova_duracao)
+
+        if nova_duracao <= 0:
+            # Remove a sessão completamente
+            async with aiosqlite.connect(DB) as db:
+                await db.execute("DELETE FROM sessions WHERE id = ?", (self.session_id,))
+                await db.commit()
+
+            await itx.response.send_message(
+                f"✅ Sessão de **{self.user.display_name}** foi **removida** completamente "
+                f"(duração zerada após remover {horas_remover}h).",
+                ephemeral=True
+            )
+            lch = bot.get_channel(LOGS_CHANNEL)
+            if lch:
+                le = discord.Embed(
+                    title="🗑️ Sessão Removida (por remoção de horas)",
+                    color=0xFF0000,
+                    timestamp=now_br()
+                )
+                le.add_field(name="Colaborador", value=f"{self.user.mention} (`{self.user.display_name}`)", inline=True)
+                le.add_field(name="Horas removidas", value=f"{horas_remover}h", inline=True)
+                le.add_field(name="Removido por", value=itx.user.mention, inline=True)
+                await lch.send(embed=le)
+        else:
+            # Atualiza a sessão com nova duração e nova saída
+            async with aiosqlite.connect(DB) as db:
+                await db.execute(
+                    "UPDATE sessions SET dur_sec = ?, close_time = ? WHERE id = ?",
+                    (nova_duracao, nova_saida.isoformat(), self.session_id)
+                )
+                await db.commit()
+
+            await itx.response.send_message(
+                f"✅ Sessão de **{self.user.display_name}** ajustada:\n"
+                f"Nova duração: **{hms(nova_duracao)}** (removido {horas_remover}h).",
+                ephemeral=True
+            )
+
+            lch = bot.get_channel(LOGS_CHANNEL)
+            if lch:
+                le = discord.Embed(
+                    title="⏱️ Horas Removidas da Sessão",
+                    color=0xE67E22,
+                    timestamp=now_br()
+                )
+                le.add_field(name="Colaborador", value=f"{self.user.mention} (`{self.user.display_name}`)", inline=True)
+                le.add_field(name="Duração anterior", value=hms(dur_sec), inline=True)
+                le.add_field(name="Nova duração", value=hms(nova_duracao), inline=True)
+                le.add_field(name="Horas removidas", value=f"{horas_remover}h", inline=True)
+                le.add_field(name="Nova saída", value=nova_saida.strftime("%d/%m/%Y %H:%M:%S"), inline=True)
+                le.add_field(name="Removido por", value=itx.user.mention, inline=True)
+                await lch.send(embed=le)
+
         asyncio.create_task(refresh_rank(force=True))
 
-        for child in self.children:
-            child.disabled = True
-        await itx.message.edit(view=self)
+
+class RemoveHoursView(discord.ui.View):
+    def __init__(self, user: discord.Member, sessions: list):
+        super().__init__(timeout=120)
+        self.user = user
+        self.sessions = sessions
+        self.selected_session_id = None
+
+        options = []
+        for sid, ot, ct, ds in sessions[:10]:
+            ot_dt = datetime.datetime.fromisoformat(ot)
+            label = f"{ot_dt.strftime('%d/%m %H:%M')} - {hms(ds)}"
+            value = str(sid)
+            options.append(discord.SelectOption(label=label, value=value, description=f"Duração: {hms(ds)}"))
+
+        if not options:
+            options.append(discord.SelectOption(label="Nenhuma sessão disponível", value="none"))
+
+        self.select = discord.ui.Select(placeholder="Selecione a sessão", options=options)
+        self.select.callback = self.select_callback
+        self.add_item(self.select)
+
+    async def select_callback(self, itx: discord.Interaction):
+        if self.select.values[0] == "none":
+            return await itx.response.send_message("Nenhuma sessão selecionável.", ephemeral=True)
+        self.selected_session_id = int(self.select.values[0])
+        # Habilita o botão de remover
+        self.remove_button.disabled = False
+        await itx.response.edit_message(view=self)
+
+    @discord.ui.button(label="🗑️ Remover Horas", style=discord.ButtonStyle.danger, disabled=True)
+    async def remove_button(self, itx: discord.Interaction, _: discord.ui.Button):
+        if self.selected_session_id is None:
+            return await itx.response.send_message("Selecione uma sessão primeiro.", ephemeral=True)
+
+        # Abrir modal
+        modal = RemoveHoursModal(self.selected_session_id, self.user)
+        await itx.response.send_modal(modal)
 
 
 # ──────────────────────────────────────────────────────────────
-#  VIEW + MODAL — AJUSTAR HORÁRIO  # NOVO
+#  VIEW + MODAL — AJUSTAR HORÁRIO
 # ──────────────────────────────────────────────────────────────
 class AdjustModal(discord.ui.Modal, title="Ajustar Horário da Sessão"):
     def __init__(self, session_id: int, user: discord.Member):
@@ -552,11 +636,9 @@ class AdjustModal(discord.ui.Modal, title="Ajustar Horário da Sessão"):
     )
 
     async def on_submit(self, itx: discord.Interaction):
-        # Verificar permissão novamente (segurança)
         if itx.user.id not in AUTHORIZED_ADJUST_IDS:
             return await itx.response.send_message("❌ Você não tem permissão.", ephemeral=True)
 
-        # Buscar dados atuais da sessão
         async with aiosqlite.connect(DB) as db:
             async with db.execute(
                 "SELECT user_id, open_time, close_time, dur_sec FROM sessions WHERE id = ?",
@@ -571,7 +653,6 @@ class AdjustModal(discord.ui.Modal, title="Ajustar Horário da Sessão"):
         if old_close is None:
             return await itx.response.send_message("❌ Não é possível ajustar uma sessão aberta.", ephemeral=True)
 
-        # Parse das novas datas
         new_open = None
         new_close = None
 
@@ -587,27 +668,19 @@ class AdjustModal(discord.ui.Modal, title="Ajustar Horário da Sessão"):
             except ValueError as e:
                 return await itx.response.send_message(f"❌ Erro na nova saída: {e}", ephemeral=True)
 
-        # Se ambos vazios, nada a fazer
         if not new_open and not new_close:
             return await itx.response.send_message("ℹ️ Nenhuma alteração fornecida.", ephemeral=True)
 
-        # Validar consistência
         final_open = new_open if new_open else datetime.datetime.fromisoformat(old_open)
         final_close = new_close if new_close else datetime.datetime.fromisoformat(old_close)
-
-        # Garantir que ambos têm timezone
         final_open = localize(final_open)
         final_close = localize(final_close)
 
         if final_close <= final_open:
-            return await itx.response.send_message(
-                "❌ A saída deve ser posterior à entrada.", ephemeral=True
-            )
+            return await itx.response.send_message("❌ A saída deve ser posterior à entrada.", ephemeral=True)
 
-        # Recalcular duração
         new_dur = int((final_close - final_open).total_seconds())
 
-        # Atualizar no banco
         async with aiosqlite.connect(DB) as db:
             await db.execute(
                 "UPDATE sessions SET open_time = ?, close_time = ?, dur_sec = ? WHERE id = ?",
@@ -615,7 +688,6 @@ class AdjustModal(discord.ui.Modal, title="Ajustar Horário da Sessão"):
             )
             await db.commit()
 
-        # Log
         lch = bot.get_channel(LOGS_CHANNEL)
         if lch:
             le = discord.Embed(
@@ -649,10 +721,9 @@ class AdjustSessionView(discord.ui.View):
         options = []
         for sid, ot, ct, ds in sessions[:10]:
             ot_dt = datetime.datetime.fromisoformat(ot)
-            ct_dt = datetime.datetime.fromisoformat(ct) if ct else None
-            label = f"{ot_dt.strftime('%d/%m %H:%M')} → {ct_dt.strftime('%H:%M') if ct_dt else 'aberto'}"
+            label = f"{ot_dt.strftime('%d/%m %H:%M')} - {hms(ds)}"
             value = str(sid)
-            options.append(discord.SelectOption(label=label, value=value, description=f"Duração: {hms(ds or 0)}"))
+            options.append(discord.SelectOption(label=label, value=value, description=f"Duração: {hms(ds)}"))
 
         if not options:
             options.append(discord.SelectOption(label="Nenhuma sessão fechada", value="none"))
@@ -670,7 +741,6 @@ class AdjustSessionView(discord.ui.View):
             return await itx.response.send_message("Nenhuma sessão disponível para ajuste.", ephemeral=True)
 
         sid = int(selected)
-        # Abrir modal
         modal = AdjustModal(sid, self.user)
         await itx.response.send_modal(modal)
 
@@ -936,50 +1006,57 @@ async def cmd_pontos_abertos(itx: discord.Interaction):
     await itx.response.send_message(embed=e, ephemeral=True)
 
 
-# /remover_horas — Apenas IDs autorizados
+# ──────────────────────────────────────────────────────────────
+#  /remover_horas — VERSÃO ATUALIZADA COM MODAL E CARGO
+# ──────────────────────────────────────────────────────────────
 @bot.tree.command(
     name="remover_horas",
-    description="[AUTORIZADO] Remove uma sessão de horas de um colaborador"
+    description="[AUTORIZADO] Remove horas de uma sessão específica de um colaborador"
 )
 @app_commands.describe(
-    colaborador="Colaborador cuja sessão será removida"
+    colaborador="Colaborador cuja sessão será ajustada"
 )
 async def cmd_remover_horas(itx: discord.Interaction, colaborador: discord.Member):
-    if itx.user.id not in AUTHORIZED_REMOVE_IDS:
+    # Verifica permissão por ID ou cargo
+    is_allowed = (
+        itx.user.id in AUTHORIZED_REMOVE_IDS or
+        any(role.name == ALLOWED_ROLE_NAME for role in itx.user.roles)
+    )
+    if not is_allowed:
         return await itx.response.send_message(
             "❌ Você não tem permissão para usar este comando.",
             ephemeral=True
         )
 
     uid = str(colaborador.id)
-    ws  = week_monday().isoformat()
 
+    # Buscar últimas 10 sessões fechadas (qualquer semana)
     async with aiosqlite.connect(DB) as db:
         async with db.execute(
             "SELECT id, open_time, close_time, dur_sec FROM sessions "
-            "WHERE user_id = ? AND week_start >= ? AND close_time IS NOT NULL "
+            "WHERE user_id = ? AND close_time IS NOT NULL "
             "ORDER BY open_time DESC LIMIT 10",
-            (uid, ws)
+            (uid,)
         ) as c:
             sessions = await c.fetchall()
 
     if not sessions:
         return await itx.response.send_message(
-            f"ℹ️ **{colaborador.display_name}** não possui sessões fechadas nesta semana.",
+            f"ℹ️ **{colaborador.display_name}** não possui sessões fechadas.",
             ephemeral=True
         )
 
-    view = RemoveSessionView(colaborador, sessions)
+    view = RemoveHoursView(colaborador, sessions)
     embed = discord.Embed(
-        title="🗑️ Remover Sessão de Horas",
-        description=f"Selecione a sessão de **{colaborador.display_name}** que deseja remover.",
-        color=0xFF0000
+        title="🗑️ Remover Horas de uma Sessão",
+        description=f"Selecione a sessão de **{colaborador.display_name}** e depois clique no botão para abrir o modal.",
+        color=0xE67E22
     )
     await itx.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 # ──────────────────────────────────────────────────────────────
-#  /ajustar_horario — Apenas IDs autorizados  # NOVO
+#  /ajustar_horario — Apenas IDs autorizados
 # ──────────────────────────────────────────────────────────────
 @bot.tree.command(
     name="ajustar_horario",
@@ -997,7 +1074,6 @@ async def cmd_ajustar_horario(itx: discord.Interaction, colaborador: discord.Mem
 
     uid = str(colaborador.id)
 
-    # Buscar últimas 10 sessões fechadas (independente da semana, para flexibilidade)
     async with aiosqlite.connect(DB) as db:
         async with db.execute(
             "SELECT id, open_time, close_time, dur_sec FROM sessions "
@@ -1016,8 +1092,7 @@ async def cmd_ajustar_horario(itx: discord.Interaction, colaborador: discord.Mem
     view = AdjustSessionView(colaborador, sessions)
     embed = discord.Embed(
         title="🔄 Ajustar Horário da Sessão",
-        description=f"Selecione a sessão de **{colaborador.display_name}** que deseja ajustar.\n"
-                    "Após selecionar, um modal permitirá alterar entrada e/ou saída.",
+        description=f"Selecione a sessão de **{colaborador.display_name}** que deseja ajustar.",
         color=0x3498DB
     )
     await itx.response.send_message(embed=embed, view=view, ephemeral=True)
