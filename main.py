@@ -20,10 +20,16 @@ from discord.ext import commands, tasks
 # ──────────────────────────────────────────────────────────────
 TOKEN         = os.environ.get("DISCORD_TOKEN")
 PANEL_CHANNEL = int(os.environ.get("PANEL_CHANNEL_ID", "1515846128493658142"))
-RANK_CHANNEL  = int(os.environ.get("RANK_CHANNEL_ID", "1515852084480839850"))   # ← NOVO
+RANK_CHANNEL  = int(os.environ.get("RANK_CHANNEL_ID", "1515852084480839850"))
 LOGS_CHANNEL  = int(os.environ.get("LOGS_CHANNEL_ID",  "1515846898156834956"))
 DB            = os.environ.get("DB_PATH", "ponto.db")
 BR_TZ         = pytz.timezone("America/Sao_Paulo")
+
+# IDs autorizados a usar o comando /ajustar_horas
+ALLOWED_REMOVE_IDS = {
+    "1480675269449617525",
+    "1508478383825354892",
+}
 
 # ──────────────────────────────────────────────────────────────
 #  BOT
@@ -57,13 +63,19 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS active (
                 user_id   TEXT PRIMARY KEY,
                 user_name TEXT NOT NULL,
-                open_time TEXT NOT NULL
+                open_time TEXT NOT NULL,
+                last_notify TEXT
             );
             CREATE TABLE IF NOT EXISTS msg_store (
                 key        TEXT PRIMARY KEY,
                 message_id TEXT NOT NULL
             );
         """)
+        # Adiciona coluna last_notify se não existir (migração)
+        try:
+            await db.execute("ALTER TABLE active ADD COLUMN last_notify TEXT")
+        except aiosqlite.OperationalError:
+            pass
         await db.commit()
 
 
@@ -216,7 +228,7 @@ async def refresh_rank(force: bool = False):
 
     async with _rank_lock:
         _last_update = time.monotonic()
-        ch = bot.get_channel(RANK_CHANNEL)   # ← USAR CANAL DE RANKING
+        ch = bot.get_channel(RANK_CHANNEL)
         if not ch:
             print(f"⚠️ Canal de ranking ({RANK_CHANNEL}) não encontrado.")
             return
@@ -234,13 +246,12 @@ async def refresh_rank(force: bool = False):
 
 
 # ──────────────────────────────────────────────────────────────
-#  VIEW — BOTÕES DE PONTO
+#  VIEW — BOTÕES DE PONTO (painel)
 # ──────────────────────────────────────────────────────────────
 class PunchView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    # ── ABRIR PONTO ──────────────────────────────────────────
     @discord.ui.button(
         label="✅  Abrir Ponto",
         style=discord.ButtonStyle.success,
@@ -284,7 +295,6 @@ class PunchView(discord.ui.View):
         e.set_footer(text="ECCO HOSPITAL CENTER • Bate Ponto")
         await itx.response.send_message(embed=e, ephemeral=True)
 
-        # Log de entrada
         lch = bot.get_channel(LOGS_CHANNEL)
         if lch:
             le = discord.Embed(title="📥 Entrada Registrada", color=0x2ECC71, timestamp=now)
@@ -296,7 +306,6 @@ class PunchView(discord.ui.View):
 
         asyncio.create_task(refresh_rank())
 
-    # ── FECHAR PONTO ─────────────────────────────────────────
     @discord.ui.button(
         label="🔴  Fechar Ponto",
         style=discord.ButtonStyle.danger,
@@ -345,7 +354,6 @@ class PunchView(discord.ui.View):
         e.set_footer(text="ECCO HOSPITAL CENTER • Bate Ponto")
         await itx.response.send_message(embed=e, ephemeral=True)
 
-        # Log de saída
         lch = bot.get_channel(LOGS_CHANNEL)
         if lch:
             le = discord.Embed(title="📤 Saída Registrada", color=0xE74C3C, timestamp=now)
@@ -358,6 +366,158 @@ class PunchView(discord.ui.View):
             await lch.send(embed=le)
 
         asyncio.create_task(refresh_rank())
+
+
+# ──────────────────────────────────────────────────────────────
+#  VIEW — NOTIFICAÇÃO POR DM (botões "continuo" / "fechar")
+# ──────────────────────────────────────────────────────────────
+class NotifyView(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=3600)  # 1 hora de validade
+        self.user_id = user_id
+
+    @discord.ui.button(label="✅ Continuo em serviço", style=discord.ButtonStyle.success)
+    async def keep_btn(self, itx: discord.Interaction, _: discord.ui.Button):
+        if itx.user.id != self.user_id:
+            return await itx.response.send_message("❌ Esse botão não é para você.", ephemeral=True)
+
+        # Atualiza last_notify para agora, para não incomodar novamente tão cedo
+        now = now_br()
+        async with aiosqlite.connect(DB) as db:
+            await db.execute(
+                "UPDATE active SET last_notify = ? WHERE user_id = ?",
+                (now.isoformat(), str(self.user_id))
+            )
+            await db.commit()
+
+        await itx.response.send_message(
+            "✅ Confirmado! Você continua em serviço. A próxima notificação será daqui a 1 hora.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="🔴 Fechar Ponto", style=discord.ButtonStyle.danger)
+    async def close_btn(self, itx: discord.Interaction, _: discord.ui.Button):
+        if itx.user.id != self.user_id:
+            return await itx.response.send_message("❌ Esse botão não é para você.", ephemeral=True)
+
+        uid = str(self.user_id)
+        name = itx.user.display_name
+        now = now_br()
+
+        async with aiosqlite.connect(DB) as db:
+            async with db.execute("SELECT open_time FROM active WHERE user_id = ?", (uid,)) as c:
+                row = await c.fetchone()
+
+        if not row:
+            return await itx.response.send_message("⚠️ Você não tem ponto aberto.", ephemeral=True)
+
+        open_dt = localize(datetime.datetime.fromisoformat(row[0]))
+        dur_sec = int((now - open_dt).total_seconds())
+        ws      = week_monday(open_dt).isoformat()
+
+        async with aiosqlite.connect(DB) as db:
+            await db.execute(
+                "INSERT INTO sessions "
+                "(user_id, user_name, open_time, close_time, dur_sec, week_start) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (uid, name, row[0], now.isoformat(), dur_sec, ws),
+            )
+            await db.execute("DELETE FROM active WHERE user_id = ?", (uid,))
+            await db.commit()
+
+        # Responde ao usuário
+        e = discord.Embed(title="🔴 Ponto Fechado com Sucesso!", color=0xE74C3C)
+        e.add_field(name="👤 Colaborador",        value=f"**{name}**",                         inline=False)
+        e.add_field(name="🕐 Entrada",             value=open_dt.strftime("%d/%m/%Y às %H:%M:%S"), inline=True)
+        e.add_field(name="🕑 Saída",               value=now.strftime("%d/%m/%Y às %H:%M:%S"),     inline=True)
+        e.add_field(name="⏱️ Duração da Sessão",   value=f"**{hms(dur_sec)}**",                    inline=False)
+        e.set_thumbnail(url=str(itx.user.display_avatar.url))
+        e.set_footer(text="ECCO HOSPITAL CENTER • Bate Ponto")
+        await itx.response.send_message(embed=e, ephemeral=True)
+
+        # Log no canal de logs
+        lch = bot.get_channel(LOGS_CHANNEL)
+        if lch:
+            le = discord.Embed(title="📤 Saída Registrada (via notificação)", color=0xE74C3C, timestamp=now)
+            le.add_field(name="Colaborador", value=f"{itx.user.mention}\n`{name}`",               inline=True)
+            le.add_field(name="Entrada",     value=open_dt.strftime("%d/%m/%Y às %H:%M:%S"),      inline=True)
+            le.add_field(name="Saída",       value=now.strftime("%d/%m/%Y às %H:%M:%S"),          inline=True)
+            le.add_field(name="Duração",     value=f"**{hms(dur_sec)}**",                         inline=True)
+            le.set_footer(text="ECCO HOSPITAL CENTER")
+            await lch.send(embed=le)
+
+        asyncio.create_task(refresh_rank())
+
+
+# ──────────────────────────────────────────────────────────────
+#  TASK — NOTIFICAR A CADA 1 HORA QUEM ESTÁ COM PONTO ABERTO
+# ──────────────────────────────────────────────────────────────
+@tasks.loop(minutes=60)
+async def hourly_notify():
+    now = now_br()
+    async with aiosqlite.connect(DB) as db:
+        async with db.execute(
+            "SELECT user_id, user_name, open_time, last_notify FROM active"
+        ) as c:
+            actives = await c.fetchall()
+
+    for uid, uname, open_time, last_notify in actives:
+        # Se já notificou há menos de 1 hora, pula
+        if last_notify:
+            try:
+                last_dt = localize(datetime.datetime.fromisoformat(last_notify))
+                if (now - last_dt).total_seconds() < 3600:
+                    continue
+            except (ValueError, TypeError):
+                pass
+
+        # Buscar o membro
+        member = bot.get_user(int(uid))
+        if member is None:
+            # Tenta buscar via API
+            try:
+                member = await bot.fetch_user(int(uid))
+            except discord.NotFound:
+                continue
+
+        # Envia DM
+        try:
+            embed = discord.Embed(
+                title="⏰ Verificação de Ponto",
+                description=(
+                    f"Olá **{uname}**!\n\n"
+                    "Você está com o ponto **aberto** há algum tempo.\n"
+                    "**Ainda está em serviço?**\n"
+                    "Clique em **Continuo em serviço** para confirmar, ou **Fechar Ponto** se já encerrou."
+                ),
+                color=0x2ECC71,
+            )
+            embed.set_footer(text="ECCO HOSPITAL CENTER • Notificação Automática")
+            view = NotifyView(user_id=int(uid))
+            await member.send(embed=embed, view=view)
+
+            # Atualiza last_notify
+            async with aiosqlite.connect(DB) as db:
+                await db.execute(
+                    "UPDATE active SET last_notify = ? WHERE user_id = ?",
+                    (now.isoformat(), uid)
+                )
+                await db.commit()
+
+            # Log da notificação
+            lch = bot.get_channel(LOGS_CHANNEL)
+            if lch:
+                le = discord.Embed(
+                    title="📨 Notificação enviada",
+                    description=f"Notificação enviada para {member.mention} (`{uname}`)",
+                    color=0x3498DB,
+                    timestamp=now
+                )
+                await lch.send(embed=le)
+
+        except (discord.Forbidden, discord.HTTPException):
+            # Usuário bloqueou DMs ou outro erro
+            continue
 
 
 # ──────────────────────────────────────────────────────────────
@@ -584,6 +744,85 @@ async def cmd_pontos_abertos(itx: discord.Interaction):
 
 
 # ──────────────────────────────────────────────────────────────
+#  /ajustar_horas — Apenas IDs autorizados
+# ──────────────────────────────────────────────────────────────
+@bot.tree.command(
+    name="ajustar_horas",
+    description="[ADMIN] Ajusta horas de um colaborador (positivo adiciona, negativo remove)",
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(
+    colaborador="Colaborador",
+    horas="Horas a adicionar (use negativo para remover, ex: -2.5)",
+)
+async def cmd_ajustar_horas(
+    itx: discord.Interaction,
+    colaborador: discord.Member,
+    horas: float,
+):
+    # Verifica se o autor tem permissão pelos IDs
+    if str(itx.user.id) not in ALLOWED_REMOVE_IDS:
+        return await itx.response.send_message(
+            "❌ Você não tem permissão para usar este comando.",
+            ephemeral=True
+        )
+
+    uid = str(colaborador.id)
+    segundos = int(horas * 3600)
+
+    if segundos == 0:
+        return await itx.response.send_message("⚠️ O valor informado é zero, nenhuma alteração feita.", ephemeral=True)
+
+    async with aiosqlite.connect(DB) as db:
+        # Busca a última sessão finalizada do colaborador
+        async with db.execute(
+            "SELECT id, dur_sec FROM sessions WHERE user_id = ? AND close_time IS NOT NULL ORDER BY close_time DESC LIMIT 1",
+            (uid,)
+        ) as c:
+            row = await c.fetchone()
+
+        if not row:
+            return await itx.response.send_message(
+                f"⚠️ **{colaborador.display_name}** não possui sessões finalizadas para ajustar.",
+                ephemeral=True
+            )
+
+        sess_id, dur_atual = row
+        novo_dur = max(0, dur_atual + segundos)
+        if novo_dur == 0 and segundos < 0:
+            # Se a duração zerou, podemos deletar a sessão? Melhor manter com 0.
+            pass
+
+        await db.execute(
+            "UPDATE sessions SET dur_sec = ? WHERE id = ?",
+            (novo_dur, sess_id)
+        )
+        await db.commit()
+
+    # Log
+    lch = bot.get_channel(LOGS_CHANNEL)
+    if lch:
+        le = discord.Embed(
+            title="🔄 Ajuste de Horas",
+            color=0xF1C40F,
+            timestamp=now_br()
+        )
+        le.add_field(name="Colaborador", value=f"{colaborador.mention} (`{colaborador.display_name}`)", inline=True)
+        le.add_field(name="Ajuste", value=f"{horas:+.2f}h", inline=True)
+        le.add_field(name="Nova duração da última sessão", value=f"**{hms(novo_dur)}**", inline=False)
+        le.set_footer(text=f"Executado por {itx.user.display_name}")
+        await lch.send(embed=le)
+
+    await itx.response.send_message(
+        f"✅ Ajuste aplicado para **{colaborador.display_name}**: {horas:+.2f}h.\n"
+        f"Nova duração da última sessão: **{hms(novo_dur)}**",
+        ephemeral=True
+    )
+
+    asyncio.create_task(refresh_rank())
+
+
+# ──────────────────────────────────────────────────────────────
 #  ON READY
 # ──────────────────────────────────────────────────────────────
 @bot.event
@@ -620,6 +859,9 @@ async def on_ready():
     else:
         await refresh_rank(force=True)
         auto_refresh.start()
+
+    # Iniciar a task de notificação a cada hora
+    hourly_notify.start()
 
     try:
         synced = await bot.tree.sync()
