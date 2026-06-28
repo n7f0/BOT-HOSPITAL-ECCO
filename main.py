@@ -29,6 +29,9 @@ BR_TZ         = pytz.timezone("America/Sao_Paulo")
 # Canal onde ficará o painel de remoção de horas
 REMOVE_PANEL_CHANNEL = 1515846758456885400
 
+# Canal onde ficará o painel de recrutamento
+RECRUIT_CHANNEL = 1480675270376558766
+
 # IDs dos cargos autorizados a remover horas
 AUTHORIZED_REMOVE_ROLE_IDS = [
     1480675269449617524,
@@ -47,6 +50,17 @@ AUTHORIZED_ADJUST_IDS = [
     1480675269449617521,
     1480675269449617523,
     1480675269449617522,
+]
+
+# IDs dos cargos que serão mencionados no botão de recrutamento
+RECRUIT_ROLE_IDS = [
+    1496602784206950571,
+    1497672467861475469,
+    1480675269449617523,
+    1480675269449617524,
+    1480675269449617525,
+    1480675269449617526,
+    1480675269449617527,
 ]
 
 # ──────────────────────────────────────────────────────────────
@@ -561,6 +575,65 @@ class RemovePanelView(discord.ui.View):
 
 
 # ──────────────────────────────────────────────────────────────
+#  VIEW — PAINEL DE RECRUTAMENTO (botão + modal)
+# ──────────────────────────────────────────────────────────────
+
+class RecruitModal(discord.ui.Modal, title="📢 Novo Recrutamento"):
+    mensagem = discord.ui.TextInput(
+        label="Mensagem de recrutamento",
+        placeholder="Digite o texto que deseja divulgar...",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=2000
+    )
+
+    async def on_submit(self, itx: discord.Interaction):
+        # Monta a menção de todos os cargos
+        role_mentions = " ".join(f"<@&{role_id}>" for role_id in RECRUIT_ROLE_IDS)
+
+        # Envia a mensagem no mesmo canal onde o botão foi clicado
+        canal = itx.channel
+        if not canal:
+            return await itx.response.send_message("❌ Não foi possível identificar o canal.", ephemeral=True)
+
+        embed = discord.Embed(
+            title="📢 Recrutamento",
+            description=self.mensagem.value,
+            color=0x00BFFF,
+            timestamp=now_br()
+        )
+        embed.set_footer(text=f"Solicitado por {itx.user.display_name}", icon_url=itx.user.display_avatar.url)
+
+        # Envia a mensagem com a menção
+        await canal.send(content=role_mentions, embed=embed)
+
+        await itx.response.send_message("✅ Mensagem de recrutamento enviada com sucesso!", ephemeral=True)
+
+        # Log no canal de logs
+        lch = bot.get_channel(LOGS_CHANNEL)
+        if lch:
+            log_embed = discord.Embed(
+                title="📢 Recrutamento realizado",
+                color=0x00BFFF,
+                timestamp=now_br()
+            )
+            log_embed.add_field(name="Solicitante", value=itx.user.mention, inline=True)
+            log_embed.add_field(name="Canal", value=canal.mention, inline=True)
+            log_embed.add_field(name="Mensagem", value=self.mensagem.value[:500] + ("..." if len(self.mensagem.value) > 500 else ""), inline=False)
+            await lch.send(embed=log_embed)
+
+
+class RecruitView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="📢 Recrutamento", style=discord.ButtonStyle.primary, custom_id="recruit_button")
+    async def recruit_btn(self, itx: discord.Interaction, _: discord.ui.Button):
+        modal = RecruitModal()
+        await itx.response.send_modal(modal)
+
+
+# ──────────────────────────────────────────────────────────────
 #  VIEW — NOTIFICAÇÃO POR DM
 # ──────────────────────────────────────────────────────────────
 class DMNotifyView(discord.ui.View):
@@ -868,6 +941,42 @@ async def cmd_setup_remove_panel(itx: discord.Interaction):
     msg = await ch.send(embed=embed, view=view)
     await save_mid("remove_panel", msg.id)
     await itx.followup.send(f"✅ Painel de remoção criado em {ch.mention}!", ephemeral=True)
+
+
+# /setup_recrutamento — Admin (NOVO)
+@bot.tree.command(name="setup_recrutamento", description="[ADMIN] Cria o painel de recrutamento no canal configurado")
+@app_commands.default_permissions(administrator=True)
+async def cmd_setup_recruit_panel(itx: discord.Interaction):
+    await itx.response.defer(ephemeral=True)
+    ch = bot.get_channel(RECRUIT_CHANNEL)
+    if not ch:
+        return await itx.followup.send("❌ Canal de recrutamento não encontrado!", ephemeral=True)
+
+    # Remove mensagem antiga se existir
+    old_mid = await load_mid("recruit_panel")
+    if old_mid:
+        try:
+            old_msg = await ch.fetch_message(old_mid)
+            await old_msg.delete()
+        except (discord.NotFound, discord.Forbidden):
+            pass
+
+    embed = discord.Embed(
+        title="📢 Painel de Recrutamento",
+        description=(
+            "Clique no botão abaixo para enviar uma mensagem de **recrutamento**.\n"
+            "Você poderá escrever o texto da divulgação e, ao enviar, os cargos autorizados serão mencionados automaticamente.\n\n"
+            "📌 Cargos que serão mencionados:\n"
+            + "\n".join(f"<@&{role_id}>" for role_id in RECRUIT_ROLE_IDS)
+        ),
+        color=0x00BFFF,
+    )
+    embed.set_footer(text="ECCO HOSPITAL CENTER • Recrutamento")
+
+    view = RecruitView()
+    msg = await ch.send(embed=embed, view=view)
+    await save_mid("recruit_panel", msg.id)
+    await itx.followup.send(f"✅ Painel de recrutamento criado em {ch.mention}!", ephemeral=True)
 
 
 # /meu_ponto — Todos
@@ -1303,6 +1412,7 @@ async def on_ready():
     # Views persistentes
     bot.add_view(PunchView())
     bot.add_view(RemovePanelView())   # Para o painel de remoção
+    bot.add_view(RecruitView())       # Para o painel de recrutamento
 
     # Painel principal de ponto
     ch_panel = bot.get_channel(PANEL_CHANNEL)
@@ -1350,6 +1460,35 @@ async def on_ready():
             print(f"📋 Painel de remoção criado no canal {REMOVE_PANEL_CHANNEL}")
     else:
         print(f"⚠️  Canal de remoção ({REMOVE_PANEL_CHANNEL}) não encontrado.")
+
+    # Painel de recrutamento (NOVO)
+    ch_recruit = bot.get_channel(RECRUIT_CHANNEL)
+    if ch_recruit:
+        mid_recruit = await load_mid("recruit_panel")
+        needs_recruit = True
+        if mid_recruit:
+            try:
+                await ch_recruit.fetch_message(mid_recruit)
+                needs_recruit = False
+            except (discord.NotFound, discord.Forbidden):
+                pass
+        if needs_recruit:
+            embed = discord.Embed(
+                title="📢 Painel de Recrutamento",
+                description=(
+                    "Clique no botão abaixo para enviar uma mensagem de **recrutamento**.\n"
+                    "Você poderá escrever o texto da divulgação e, ao enviar, os cargos autorizados serão mencionados automaticamente.\n\n"
+                    "📌 Cargos que serão mencionados:\n"
+                    + "\n".join(f"<@&{role_id}>" for role_id in RECRUIT_ROLE_IDS)
+                ),
+                color=0x00BFFF,
+            )
+            embed.set_footer(text="ECCO HOSPITAL CENTER • Recrutamento")
+            msg = await ch_recruit.send(embed=embed, view=RecruitView())
+            await save_mid("recruit_panel", msg.id)
+            print(f"📋 Painel de recrutamento criado no canal {RECRUIT_CHANNEL}")
+    else:
+        print(f"⚠️  Canal de recrutamento ({RECRUIT_CHANNEL}) não encontrado.")
 
     # Ranking
     ch_rank = bot.get_channel(RANK_CHANNEL)
