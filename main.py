@@ -266,33 +266,28 @@ async def set_ia_enabled(channel_id: str, enabled: bool):
                     (channel_id, 1 if enabled else 0))
     await db.commit()
 
-# ─── NOVA FUNÇÃO: SUBSTITUI NOMES DE CANAIS POR MENÇÕES ───
+# ─── FUNÇÃO MELHORADA: SUBSTITUI NOMES DE CANAIS POR MENÇÕES ───
 def replace_channel_mentions(text: str, guild: discord.Guild) -> str:
     """
     Substitui nomes de canais (case insensitive) por menções <#ID>.
+    Suporta nomes com espaços e evita substituir dentro de menções existentes.
     Exemplo: "Vamos no geral" -> "Vamos no <#123456789>"
     """
-    if not guild:
+    if not guild or not text:
         return text
-    # Mapeia nome do canal -> ID (case insensitive)
-    channel_map = {}
-    for channel in guild.channels:
-        # Ignora canais de categoria e de voz? Incluímos todos, mas pode filtrar se quiser
-        channel_map[channel.name.lower()] = channel.id
 
-    # Função de substituição: procura por palavras que coincidam exatamente com um nome de canal
-    def replace_match(match):
-        word = match.group(0)
-        # Remove pontuação ao redor? Já que é palavra inteira com boundaries, não precisa
-        lower_word = word.lower()
-        if lower_word in channel_map:
-            return f"<#{channel_map[lower_word]}>"
-        return word
-
-    # Usa regex para capturar palavras que podem ser nomes de canais
-    # Vamos considerar palavras com letras, números, underlines, hífens (comuns em canais)
-    pattern = re.compile(r'\b[a-zA-Z0-9_\-]+\b')
-    return pattern.sub(replace_match, text)
+    # Coleta todos os canais (texto, voz, categoria) e ordena por tamanho do nome (maior primeiro)
+    channels = sorted(guild.channels, key=lambda c: len(c.name), reverse=True)
+    
+    # Itera sobre cada canal e substitui o nome exato (case insensitive)
+    for channel in channels:
+        # Escapa caracteres especiais do nome para usar em regex
+        escaped_name = re.escape(channel.name)
+        # Usa lookarounds para evitar substituir dentro de menções <#...> ou <@...>
+        pattern = re.compile(r'(?<![#<])' + escaped_name + r'(?![#>])', re.IGNORECASE)
+        text = pattern.sub(f"<#{channel.id}>", text)
+    
+    return text
 
 # ──────────────────────────────────────────────────────────────
 #  TASKS — OTIMIZADAS
@@ -308,10 +303,8 @@ async def check_reminders():
             await mark_reminder_done(rid)
             continue
         
-        # Obtém o objeto Guild para substituir menções de canal
         channel_obj = bot.get_channel(int(cid))
         guild = channel_obj.guild if channel_obj else None
-        # Substitui nomes de canais por menções
         msg_processed = replace_channel_mentions(msg, guild)
 
         embed = discord.Embed(
@@ -322,9 +315,7 @@ async def check_reminders():
         )
         embed.set_footer(text=f"Agendado para {remind_at}")
         try:
-            # Envia DM
             await user.send(embed=embed)
-            # Envia no canal original
             channel = bot.get_channel(int(cid))
             if channel:
                 await channel.send(f"{user.mention} ⏰ Lembrete: {msg_processed}")
@@ -778,6 +769,9 @@ async def cmd_ia(itx: discord.Interaction, pergunta: str):
         if not resposta_texto:
             return await itx.followup.send("❌ Falha ao conectar com a IA no momento.")
 
+        # 🔹 SUBSTITUI NOMES DE CANAIS POR MENÇÕES NA RESPOSTA
+        resposta_texto = replace_channel_mentions(resposta_texto, itx.guild)
+
         conv_id = await save_conversation(str(itx.user.id), str(itx.channel_id), pergunta, resposta_texto)
         for topico in extract_topics(pergunta)[:3]:
             await update_user_pattern(str(itx.user.id), topico)
@@ -824,6 +818,9 @@ async def on_message(msg: discord.Message):
                 resposta_texto = await fetch_gemini_fallback(contexto)
 
             if resposta_texto:
+                # 🔹 SUBSTITUI NOMES DE CANAIS POR MENÇÕES NA RESPOSTA
+                resposta_texto = replace_channel_mentions(resposta_texto, msg.guild)
+
                 conv_id = await save_conversation(str(msg.author.id), str(msg.channel.id), msg.content, resposta_texto)
                 for topico in extract_topics(msg.content)[:3]:
                     await update_user_pattern(str(msg.author.id), topico)
