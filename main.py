@@ -60,7 +60,7 @@ else:
     logger.warning("Chave API Gemini não encontrada.")
 
 # ──────────────────────────────────────────────────────────────
-#  CONFIGURAÇÃO DO BOT
+#  CONFIGURAÇÃO DO BOT E CANAIS
 # ──────────────────────────────────────────────────────────────
 TOKEN         = os.environ.get("DISCORD_TOKEN")
 PANEL_CHANNEL = int(os.environ.get("PANEL_CHANNEL_ID", "1515846128493658142"))
@@ -70,12 +70,13 @@ DB            = os.environ.get("DB_PATH", "ponto.db")
 BR_TZ         = pytz.timezone("America/Sao_Paulo")
 
 REMOVE_PANEL_CHANNEL = 1515846758456885400
-RECRUIT_CHANNEL = 1480675270376558766
+RECRUIT_CHANNEL      = 1480675270376558766
+RECRUIT_LOGS_CHANNEL = 1522978231173775423
 
+# Cargos
 AUTHORIZED_REMOVE_ROLE_IDS = [1480675269449617524, 1480675269449617523, 1480675269449617522, 1480675269449617521, 1480675269449617525]
-AUTHORIZED_REMOVE_IDS = [1480675269449617525, 1508478383825354892]
-AUTHORIZED_ADJUST_IDS = [1480675269449617524, 1480675269449617521, 1480675269449617523, 1480675269449617522]
 RECRUIT_ROLE_IDS = [1496602784206950571, 1497672467861475469, 1480675269449617523, 1480675269449617524, 1480675269449617525, 1480675269449617526, 1480675269449617527]
+RECRUIT_APPROVED_ROLE_IDS = [1480675269428772992, 1480675269420257424]
 
 STOPWORDS_PTBR = {
     'para', 'como', 'por', 'com', 'uma', 'sobre', 'quando', 'onde', 'qual', 'mais', 'muito', 'pode', 'isso',
@@ -92,7 +93,7 @@ _rank_lock = asyncio.Lock()
 _last_update: float = 0.0
 
 # ──────────────────────────────────────────────────────────────
-#  GERENCIADOR DE BANCO DE DADOS (Conexão Persistente)
+#  GERENCIADOR DE BANCO DE DADOS
 # ──────────────────────────────────────────────────────────────
 class DatabaseManager:
     def __init__(self, db_path):
@@ -191,23 +192,6 @@ async def init_db():
     """)
     await db.commit()
 
-    # Migrações
-    col_names = [col[1] for col in await db.fetchall("PRAGMA table_info(conversation_history)")]
-    if "rating" not in col_names:
-        await db.execute("ALTER TABLE conversation_history ADD COLUMN rating INTEGER DEFAULT 0")
-        logger.info("Migração: 'rating' adicionado a conversation_history.")
-
-    col_names = [col[1] for col in await db.fetchall("PRAGMA table_info(knowledge_base)")]
-    if "upvotes" not in col_names:
-        await db.execute("ALTER TABLE knowledge_base ADD COLUMN upvotes INTEGER DEFAULT 0")
-        logger.info("Migração: colunas de avaliação adicionadas à knowledge_base.")
-
-    col_names = [col[1] for col in await db.fetchall("PRAGMA table_info(reminders)")]
-    if "done" not in col_names:
-        await db.execute("ALTER TABLE reminders ADD COLUMN done INTEGER DEFAULT 0")
-        logger.info("Migração: 'done' adicionado a reminders.")
-    await db.commit()
-
 # ──────────────────────────────────────────────────────────────
 #  FUNÇÕES AUXILIARES PARA APRENDIZADO & DB
 # ──────────────────────────────────────────────────────────────
@@ -217,7 +201,6 @@ async def save_conversation(user_id: str, channel_id: str, message: str, respons
         (user_id, channel_id, message, response, rating, datetime.datetime.now(BR_TZ).isoformat())
     )
     await db.commit()
-    # Retorna o ID da última inserção
     row = await db.fetchone("SELECT last_insert_rowid()")
     return row[0] if row else 0
 
@@ -269,18 +252,6 @@ async def get_channel_history(channel_id: str, limit: int = 20) -> list:
     )
     return list(reversed(rows))
 
-async def get_user_history(user_id: str, limit: int = 10) -> list:
-    rows = await db.fetchall(
-        "SELECT message, response, rating, timestamp FROM conversation_history WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?",
-        (user_id, limit)
-    )
-    return list(reversed(rows))
-
-async def add_reminder(user_id: str, channel_id: str, message: str, remind_at: datetime.datetime):
-    await db.execute("INSERT INTO reminders (user_id, channel_id, message, remind_at) VALUES (?, ?, ?, ?)",
-                    (user_id, channel_id, message, remind_at.isoformat()))
-    await db.commit()
-
 async def mark_reminder_done(reminder_id: int):
     await db.execute("UPDATE reminders SET done = 1 WHERE id = ?", (reminder_id,))
     await db.commit()
@@ -325,12 +296,10 @@ async def check_reminders():
 
 @tasks.loop(hours=24)
 async def cleanup_database():
-    """Limpa o histórico de mensagens da IA antigas para o banco não inchar"""
     thirty_days_ago = (datetime.datetime.now(BR_TZ) - datetime.timedelta(days=30)).isoformat()
     try:
         await db.execute("DELETE FROM conversation_history WHERE timestamp < ?", (thirty_days_ago,))
         await db.commit()
-        logger.info("Limpeza do banco de dados concluída: Mensagens antigas removidas.")
     except Exception as e:
         logger.error(f"Erro na limpeza do banco: {e}")
 
@@ -352,14 +321,6 @@ def hms(sec: float) -> str:
     h, r = divmod(sec, 3600)
     m, s = divmod(r, 60)
     return f"{h:02d}h {m:02d}m {s:02d}s"
-
-def parse_datetime_br(text: str) -> datetime.datetime:
-    text = text.strip()
-    match = re.match(r"^(\d{2})/(\d{2})/(\d{4})\s+(\d{2}):(\d{2})(?::(\d{2}))?$", text)
-    if not match: raise ValueError("Formato inválido. Use DD/MM/AAAA HH:MM")
-    day, month, year, hour, minute, second = match.groups()
-    dt = datetime.datetime(int(year), int(month), int(day), int(hour), int(minute), int(second or "0"))
-    return BR_TZ.localize(dt) if dt.tzinfo is None else dt
 
 def extract_user_id(text: str) -> int:
     match = re.search(r'<@!?(\d+)>', text)
@@ -393,6 +354,9 @@ async def get_rank() -> list:
         
     return sorted(totals.items(), key=lambda x: x[1][1], reverse=True)
 
+# ──────────────────────────────────────────────────────────────
+#  PAINÉIS EMBEDS
+# ──────────────────────────────────────────────────────────────
 def panel_embed() -> discord.Embed:
     e = discord.Embed(
         title="🏥 ECCO HOSPITAL CENTER",
@@ -400,6 +364,38 @@ def panel_embed() -> discord.Embed:
         color=0x1565C0,
     )
     e.set_footer(text="ECCO HOSPITAL CENTER • Ponto Eletrônico")
+    return e
+
+def remove_panel_embed() -> discord.Embed:
+    e = discord.Embed(
+        title="⏱️ Administração — Gerenciamento de Horas e Bot",
+        description=(
+            "**Painel Administrativo**\n"
+            "Selecione um membro no menu abaixo para ajustar ou remover horas contabilizadas indevidamente.\n\n"
+            "🛠️ **Comandos Disponíveis do Bot:**\n"
+            "`/ia` - Faça uma pergunta para a IA assistente.\n"
+            "`/ativar_ia` - [Admin] Ativa a IA no canal atual.\n"
+            "`/desativar_ia` - [Admin] Desativa a IA no canal.\n"
+            "`/meu_ponto` - Consulte as suas horas trabalhadas nesta semana.\n"
+            "`/sync` - [Admin] Sincroniza os comandos de barra do bot."
+        ),
+        color=0xE74C3C
+    )
+    e.set_footer(text="Apenas membros autorizados podem executar alterações.")
+    return e
+
+def recruit_panel_embed() -> discord.Embed:
+    e = discord.Embed(
+        title="📢 Central de Recrutamento - ECCO HOSPITAL",
+        description=(
+            "**Faça parte da nossa equipe médica!**\n\n"
+            "Para se candidatar a uma vaga no ECCO HOSPITAL, clique no botão **'Recrutamento'** abaixo.\n"
+            "Preencha o formulário informando sua experiência prévia, disponibilidade de horário e os motivos pelos quais deseja integrar nossa equipe.\n\n"
+            "⚠️ **Atenção:** Seja claro e objetivo. Nossa diretoria avaliará seu perfil e a aprovação será notificada aos responsáveis."
+        ),
+        color=0x00BFFF
+    )
+    e.set_footer(text="Diretoria ECCO HOSPITAL")
     return e
 
 async def rank_embed() -> discord.Embed:
@@ -441,7 +437,7 @@ async def refresh_rank(force: bool = False):
     async with _rank_lock:
         _last_update = time.monotonic()
         ch = bot.get_channel(RANK_CHANNEL)
-        if not ch: return logger.warning(f"Canal de ranking ({RANK_CHANNEL}) não encontrado.")
+        if not ch: return
         
         emb = await rank_embed()
         mid = await load_mid("rank")
@@ -458,7 +454,7 @@ async def refresh_rank(force: bool = False):
         except Exception as e: logger.error(f"Erro ao enviar painel de rank: {e}")
 
 # ──────────────────────────────────────────────────────────────
-#  VIEWS (Manter a mesma interface para o usuário)
+#  VIEWS INTERATIVAS
 # ──────────────────────────────────────────────────────────────
 class RatingView(discord.ui.View):
     def __init__(self, conversation_id: int, message_id: int):
@@ -537,59 +533,124 @@ class PunchView(discord.ui.View):
             await lch.send(embed=le)
         asyncio.create_task(refresh_rank())
 
-# (Para economizar espaço, as classes RemovePanelView, RecruitView, etc mantêm o padrão, mas substituindo as chamadas de banco e prints)
-class RemovePanelView(discord.ui.View):
-    def __init__(self): super().__init__(timeout=None)
-    @discord.ui.button(label="⏱️ Remover Horas", style=discord.ButtonStyle.danger, custom_id="remove_hours_panel")
-    async def remove_hours_btn(self, itx: discord.Interaction, _: discord.ui.Button):
-        await itx.response.send_modal(RemoveHoursFromMemberModal())
+# --- SISTEMA DE REMOÇÃO DE HORAS COM DUAS ETAPAS ---
+class RemoveHoursAmountModal(discord.ui.Modal):
+    horas = discord.ui.TextInput(label="Horas a remover (Ex: 1.5)", placeholder="Digite um número...", required=True)
+    
+    def __init__(self, target_user: discord.Member):
+        title_name = target_user.display_name[:20]
+        super().__init__(title=f"Remover hrs de {title_name}")
+        self.target_user = target_user
 
-class RemoveHoursFromMemberModal(discord.ui.Modal, title="Remover Horas"):
-    membro = discord.ui.TextInput(label="Membro (ID ou menção)", required=True)
-    horas = discord.ui.TextInput(label="Horas a remover (Ex: 1.5)", required=True)
     async def on_submit(self, itx: discord.Interaction):
         if not any(r.id in AUTHORIZED_REMOVE_ROLE_IDS for r in itx.user.roles):
             return await itx.response.send_message("❌ Sem permissão.", ephemeral=True)
-        uid = extract_user_id(self.membro.value)
-        if not uid: return await itx.response.send_message("❌ ID inválido.", ephemeral=True)
-        
+            
         try: hrs = float(self.horas.value.replace(',', '.'))
-        except ValueError: return await itx.response.send_message("❌ Valor inválido.", ephemeral=True)
+        except ValueError: return await itx.response.send_message("❌ Valor numérico inválido.", ephemeral=True)
         
-        row = await db.fetchone("SELECT id, open_time, close_time, dur_sec FROM sessions WHERE user_id = ? AND close_time IS NOT NULL ORDER BY close_time DESC LIMIT 1", (str(uid),))
-        if not row: return await itx.response.send_message("ℹ️ Nenhuma sessão fechada encontrada.", ephemeral=True)
+        uid = str(self.target_user.id)
+        row = await db.fetchone("SELECT id, open_time, close_time, dur_sec FROM sessions WHERE user_id = ? AND close_time IS NOT NULL ORDER BY close_time DESC LIMIT 1", (uid,))
+        if not row: return await itx.response.send_message(f"ℹ️ Nenhuma sessão fechada encontrada para {self.target_user.mention}.", ephemeral=True)
         
         session_id, ot, ct, dur = row
         rem_sec = int(hrs * 3600)
         
-        if dur < rem_sec: return await itx.response.send_message(f"❌ Sessão muito curta ({hms(dur)}).", ephemeral=True)
+        if dur < rem_sec: return await itx.response.send_message(f"❌ A última sessão é muito curta ({hms(dur)}).", ephemeral=True)
         nova_dur = dur - rem_sec
         
         if nova_dur <= 0:
             await db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
-            msg = "Sessão removida."
+            msg = "Sessão totalmente removida."
         else:
             nova_saida = datetime.datetime.fromisoformat(ot) + datetime.timedelta(seconds=nova_dur)
             await db.execute("UPDATE sessions SET dur_sec = ?, close_time = ? WHERE id = ?", (nova_dur, nova_saida.isoformat(), session_id))
             msg = f"Sessão ajustada para {hms(nova_dur)}."
         await db.commit()
-        await itx.response.send_message(f"✅ {msg}", ephemeral=True)
+        await itx.response.send_message(f"✅ Sucesso para {self.target_user.mention}: {msg}", ephemeral=True)
         asyncio.create_task(refresh_rank(force=True))
+
+class RemoveHoursUserSelect(discord.ui.UserSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="👥 Selecione o membro para remover horas...",
+            min_values=1, max_values=1, custom_id="select_user_remove_hours"
+        )
+        
+    async def callback(self, itx: discord.Interaction):
+        if not any(r.id in AUTHORIZED_REMOVE_ROLE_IDS for r in itx.user.roles):
+            return await itx.response.send_message("❌ Você não tem permissão para usar este painel.", ephemeral=True)
+        selected_user = self.values[0]
+        await itx.response.send_modal(RemoveHoursAmountModal(selected_user))
+
+class RemovePanelView(discord.ui.View):
+    def __init__(self): 
+        super().__init__(timeout=None)
+        self.add_item(RemoveHoursUserSelect())
+
+# --- SISTEMA DE RECRUTAMENTO ---
+class RecruitActionView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        
+    @discord.ui.button(label="✅ Aprovar", style=discord.ButtonStyle.success, custom_id="recruit_approve")
+    async def btn_approve(self, itx: discord.Interaction, btn: discord.ui.Button):
+        if not any(r.id in AUTHORIZED_REMOVE_ROLE_IDS for r in itx.user.roles) and not itx.user.guild_permissions.administrator:
+            return await itx.response.send_message("❌ Sem permissão.", ephemeral=True)
+            
+        embed = itx.message.embeds[0]
+        uid = extract_user_id(embed.fields[0].value)
+        
+        if uid:
+            member = itx.guild.get_member(uid)
+            if member:
+                try:
+                    roles = [itx.guild.get_role(r) for r in RECRUIT_APPROVED_ROLE_IDS if itx.guild.get_role(r)]
+                    if roles: await member.add_roles(*roles)
+                except Exception as e:
+                    logger.error(f"Erro ao dar cargos: {e}")
+        
+        embed.color = 0x2ECC71
+        embed.title = "✅ Candidatura Aprovada"
+        embed.set_footer(text=f"Aprovado por {itx.user.display_name}")
+        
+        for child in self.children: child.disabled = True
+        await itx.message.edit(embed=embed, view=self)
+        await itx.response.send_message("✅ Candidato aprovado e cargos adicionados!", ephemeral=True)
+
+    @discord.ui.button(label="❌ Recusar", style=discord.ButtonStyle.danger, custom_id="recruit_deny")
+    async def btn_deny(self, itx: discord.Interaction, btn: discord.ui.Button):
+        if not any(r.id in AUTHORIZED_REMOVE_ROLE_IDS for r in itx.user.roles) and not itx.user.guild_permissions.administrator:
+            return await itx.response.send_message("❌ Sem permissão.", ephemeral=True)
+            
+        embed = itx.message.embeds[0]
+        embed.color = 0xE74C3C
+        embed.title = "❌ Candidatura Recusada"
+        embed.set_footer(text=f"Recusado por {itx.user.display_name}")
+        
+        for child in self.children: child.disabled = True
+        await itx.message.edit(embed=embed, view=self)
+        await itx.response.send_message("❌ Candidatura recusada.", ephemeral=True)
+
+class RecruitModal(discord.ui.Modal, title="📢 Formulário de Recrutamento"):
+    mensagem = discord.ui.TextInput(label="Sua experiência e motivo", style=discord.TextStyle.paragraph, required=True, placeholder="Descreva sua experiência, disponibilidade...")
+    
+    async def on_submit(self, itx: discord.Interaction):
+        await itx.response.send_message("✅ Sua candidatura foi enviada e será analisada pela diretoria!", ephemeral=True)
+        log_channel = bot.get_channel(RECRUIT_LOGS_CHANNEL)
+        if log_channel:
+            embed = discord.Embed(title="📄 Nova Candidatura Recebida", color=0xFFA500, timestamp=now_br())
+            embed.add_field(name="Candidato", value=f"{itx.user.mention} (`{itx.user.name}`)", inline=False)
+            embed.add_field(name="Apresentação", value=self.mensagem.value, inline=False)
+            embed.set_thumbnail(url=str(itx.user.display_avatar.url))
+            
+            await log_channel.send(embed=embed, view=RecruitActionView())
 
 class RecruitView(discord.ui.View):
     def __init__(self): super().__init__(timeout=None)
-    @discord.ui.button(label="📢 Recrutamento", style=discord.ButtonStyle.primary, custom_id="recruit_button")
+    @discord.ui.button(label="📢 Fazer Recrutamento", style=discord.ButtonStyle.primary, custom_id="recruit_button")
     async def recruit_btn(self, itx: discord.Interaction, _: discord.ui.Button):
         await itx.response.send_modal(RecruitModal())
-
-class RecruitModal(discord.ui.Modal, title="📢 Novo Recrutamento"):
-    mensagem = discord.ui.TextInput(label="Mensagem", style=discord.TextStyle.paragraph, required=True)
-    async def on_submit(self, itx: discord.Interaction):
-        role_mentions = " ".join(f"<@&{r}>" for r in RECRUIT_ROLE_IDS)
-        embed = discord.Embed(title="📢 Recrutamento", description=self.mensagem.value, color=0x00BFFF, timestamp=now_br())
-        embed.set_footer(text=f"Por {itx.user.display_name}")
-        await itx.channel.send(content=role_mentions, embed=embed)
-        await itx.response.send_message("✅ Enviado!", ephemeral=True)
 
 class DMNotifyView(discord.ui.View):
     def __init__(self, user_id: int):
@@ -617,10 +678,9 @@ class DMNotifyView(discord.ui.View):
         asyncio.create_task(refresh_rank())
 
 # ──────────────────────────────────────────────────────────────
-#  COMANDOS DA IA OTIMIZADOS COM ASYNC
+#  COMANDOS DA IA OTIMIZADOS
 # ──────────────────────────────────────────────────────────────
 async def fetch_gemini_fallback(contexto: str) -> str:
-    """Fallback 100% assíncrono para gerar a resposta se o SDK falhar"""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
     payload = {"contents": [{"parts": [{"text": contexto}]}]}
     
@@ -634,7 +694,6 @@ async def fetch_gemini_fallback(contexto: str) -> str:
     return None
 
 def extract_topics(text: str) -> list:
-    """Extrai tópicos relevantes usando a lista de stopwords em português"""
     palavras = set(re.findall(r'\b[a-záéíóúâêôãõç]{4,}\b', text.lower()))
     return [p for p in palavras if p not in STOPWORDS_PTBR]
 
@@ -648,7 +707,6 @@ async def cmd_ia(itx: discord.Interaction, pergunta: str):
     
     try:
         channel_history = await get_channel_history(str(itx.channel_id), limit=20)
-        user_history = await get_user_history(str(itx.user.id), limit=10)
         user_patterns = await get_user_patterns(str(itx.user.id))
         knowledge = await get_knowledge(pergunta)
 
@@ -666,7 +724,6 @@ async def cmd_ia(itx: discord.Interaction, pergunta: str):
         for modelo in GEMINI_MODELS:
             try:
                 model = genai.GenerativeModel(modelo)
-                # OTIMIZAÇÃO: Chamada Assíncrona para não travar o Event Loop
                 resposta = await model.generate_content_async(contexto)
                 resposta_texto = resposta.text.strip()
                 break
@@ -680,10 +737,7 @@ async def cmd_ia(itx: discord.Interaction, pergunta: str):
         if not resposta_texto:
             return await itx.followup.send("❌ Falha ao conectar com a IA no momento.")
 
-        # Salva a conversa
         conv_id = await save_conversation(str(itx.user.id), str(itx.channel_id), pergunta, resposta_texto)
-        
-        # Padrões e Conhecimento
         for topico in extract_topics(pergunta)[:3]:
             await update_user_pattern(str(itx.user.id), topico)
         await save_knowledge(pergunta, resposta_texto)
@@ -720,7 +774,6 @@ async def on_message(msg: discord.Message):
             for modelo in GEMINI_MODELS:
                 try:
                     model = genai.GenerativeModel(modelo)
-                    # OTIMIZAÇÃO: Chamada Assíncrona
                     resposta = await model.generate_content_async(contexto)
                     resposta_texto = resposta.text.strip()
                     break
@@ -744,7 +797,7 @@ async def on_message(msg: discord.Message):
     await bot.process_commands(msg)
 
 # ──────────────────────────────────────────────────────────────
-#  OUTROS COMANDOS MANTIDOS (Resumo)
+#  COMANDOS DE BARRA
 # ──────────────────────────────────────────────────────────────
 @bot.tree.command(name="ativar_ia", description="[ADMIN] Ativa IA no canal")
 @app_commands.default_permissions(administrator=True)
@@ -783,7 +836,7 @@ async def cmd_sync(itx: discord.Interaction):
     await itx.followup.send(f"✅ Sincronizados: {len(synced)}", ephemeral=True)
 
 # ──────────────────────────────────────────────────────────────
-#  TASKS RECORRENTES
+#  TASKS RECORRENTES SECUNDÁRIAS
 # ──────────────────────────────────────────────────────────────
 @tasks.loop(minutes=5)
 async def auto_refresh():
@@ -799,7 +852,7 @@ async def notify_active_users():
             embed = discord.Embed(title="⏰ Verificação de Ponto", description=f"Olá {uname}, você ainda está em serviço?", color=0x3498DB)
             await user.send(embed=embed, view=DMNotifyView(int(uid)))
         except discord.Forbidden:
-            logger.info(f"DM bloqueada para o usuário {uid}")
+            pass
         except Exception as e:
             logger.error(f"Erro ao notificar usuário {uid}: {e}")
 
@@ -813,12 +866,12 @@ async def on_ready():
     bot.add_view(PunchView())
     bot.add_view(RemovePanelView())
     bot.add_view(RecruitView())
+    bot.add_view(RecruitActionView()) # Adicionado para os botões de aprovar/recusar continuarem funcionando
 
-    # Garantir recriação dos painéis, se necessário
     for ch_id, key, view_cls, emb_func in [
         (PANEL_CHANNEL, "panel", PunchView, panel_embed),
-        (REMOVE_PANEL_CHANNEL, "remove_panel", RemovePanelView, lambda: discord.Embed(title="⏱️ Painel de Remoção de Horas")),
-        (RECRUIT_CHANNEL, "recruit_panel", RecruitView, lambda: discord.Embed(title="📢 Painel de Recrutamento"))
+        (REMOVE_PANEL_CHANNEL, "remove_panel", RemovePanelView, remove_panel_embed),
+        (RECRUIT_CHANNEL, "recruit_panel", RecruitView, recruit_panel_embed)
     ]:
         ch = bot.get_channel(ch_id)
         if ch:
@@ -832,7 +885,7 @@ async def on_ready():
     auto_refresh.start()
     notify_active_users.start()
     check_reminders.start()
-    cleanup_database.start()  # Nova Task para limpar DB!
+    cleanup_database.start()
 
     try:
         synced = await bot.tree.sync()
