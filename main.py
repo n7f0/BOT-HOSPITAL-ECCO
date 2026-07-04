@@ -3,7 +3,7 @@
 ║          ECCO HOSPITAL CENTER — BOT DE BATE PONTO           ║
 ║        COM IA, MEMÓRIA, APRENDIZADO CONTÍNUO E AVALIAÇÃO    ║
 ║           COMANDOS: /ativar_ia /desativar_ia /sync          ║
-║                /lembrar (data/hora) /meu_ponto              ║
+║         /lembrar (com substituição automática de canais)    ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -266,6 +266,34 @@ async def set_ia_enabled(channel_id: str, enabled: bool):
                     (channel_id, 1 if enabled else 0))
     await db.commit()
 
+# ─── NOVA FUNÇÃO: SUBSTITUI NOMES DE CANAIS POR MENÇÕES ───
+def replace_channel_mentions(text: str, guild: discord.Guild) -> str:
+    """
+    Substitui nomes de canais (case insensitive) por menções <#ID>.
+    Exemplo: "Vamos no geral" -> "Vamos no <#123456789>"
+    """
+    if not guild:
+        return text
+    # Mapeia nome do canal -> ID (case insensitive)
+    channel_map = {}
+    for channel in guild.channels:
+        # Ignora canais de categoria e de voz? Incluímos todos, mas pode filtrar se quiser
+        channel_map[channel.name.lower()] = channel.id
+
+    # Função de substituição: procura por palavras que coincidam exatamente com um nome de canal
+    def replace_match(match):
+        word = match.group(0)
+        # Remove pontuação ao redor? Já que é palavra inteira com boundaries, não precisa
+        lower_word = word.lower()
+        if lower_word in channel_map:
+            return f"<#{channel_map[lower_word]}>"
+        return word
+
+    # Usa regex para capturar palavras que podem ser nomes de canais
+    # Vamos considerar palavras com letras, números, underlines, hífens (comuns em canais)
+    pattern = re.compile(r'\b[a-zA-Z0-9_\-]+\b')
+    return pattern.sub(replace_match, text)
+
 # ──────────────────────────────────────────────────────────────
 #  TASKS — OTIMIZADAS
 # ──────────────────────────────────────────────────────────────
@@ -276,23 +304,34 @@ async def check_reminders():
     
     for rid, uid, cid, msg, remind_at in reminders:
         user = bot.get_user(int(uid))
-        if user:
-            embed = discord.Embed(
-                title="⏰ Lembrete!",
-                description=f"Olá {user.mention}, você pediu para lembrar:\n\n**{msg}**",
-                color=0xFFA500,
-                timestamp=datetime.datetime.now(BR_TZ)
-            )
-            embed.set_footer(text=f"Agendado para {remind_at}")
-            try:
-                await user.send(embed=embed)
-                channel = bot.get_channel(int(cid))
-                if channel:
-                    await channel.send(f"{user.mention} ⏰ Lembrete: {msg}")
-            except discord.Forbidden:
-                logger.warning(f"Não foi possível enviar DM de lembrete para {user.id}.")
-            except Exception as e:
-                logger.error(f"Erro ao enviar lembrete para {user.id}: {e}")
+        if not user:
+            await mark_reminder_done(rid)
+            continue
+        
+        # Obtém o objeto Guild para substituir menções de canal
+        channel_obj = bot.get_channel(int(cid))
+        guild = channel_obj.guild if channel_obj else None
+        # Substitui nomes de canais por menções
+        msg_processed = replace_channel_mentions(msg, guild)
+
+        embed = discord.Embed(
+            title="⏰ Lembrete!",
+            description=f"Olá {user.mention}, você pediu para lembrar:\n\n**{msg_processed}**",
+            color=0xFFA500,
+            timestamp=datetime.datetime.now(BR_TZ)
+        )
+        embed.set_footer(text=f"Agendado para {remind_at}")
+        try:
+            # Envia DM
+            await user.send(embed=embed)
+            # Envia no canal original
+            channel = bot.get_channel(int(cid))
+            if channel:
+                await channel.send(f"{user.mention} ⏰ Lembrete: {msg_processed}")
+        except discord.Forbidden:
+            logger.warning(f"Não foi possível enviar DM de lembrete para {user.id}.")
+        except Exception as e:
+            logger.error(f"Erro ao enviar lembrete para {user.id}: {e}")
         await mark_reminder_done(rid)
 
 @tasks.loop(hours=24)
@@ -830,7 +869,6 @@ async def cmd_meu_ponto(itx: discord.Interaction):
     e.add_field(name="⏱️ Total", value=f"**{hms(total)}**")
     await itx.response.send_message(embed=e, ephemeral=True)
 
-# ─── NOVO COMANDO /lembrar com DATA E HORA ───
 @bot.tree.command(name="lembrar", description="Define um lembrete para uma data/hora específica (DD/MM/AAAA HH:MM)")
 @app_commands.describe(data_hora="Data e hora no formato DD/MM/AAAA HH:MM (ex: 25/12/2026 15:30)", mensagem="Mensagem do lembrete")
 async def cmd_lembrar(itx: discord.Interaction, data_hora: str, mensagem: str):
