@@ -1,7 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║          ECCO HOSPITAL CENTER — BOT DE BATE PONTO           ║
-║                     + IA GEMINI (google.genai)              ║
+║                  + IA GEMINI (google-generativeai)          ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -10,6 +10,7 @@ import datetime
 import os
 import time
 import re
+import warnings
 
 import aiosqlite
 import discord
@@ -18,37 +19,33 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 # ──────────────────────────────────────────────────────────────
-#  CONFIGURAÇÃO DA IA (GEMINI - novo pacote google.genai)
+#  CONFIGURAÇÃO DA IA (GEMINI - google-generativeai)
 # ──────────────────────────────────────────────────────────────
-from google import genai
+# Suprime aviso de depreciação (opcional)
+warnings.filterwarnings("ignore", category=FutureWarning, module="google.generativeai")
+
+import google.generativeai as genai
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if GEMINI_API_KEY:
-    GEMINI_CLIENT = genai.Client(api_key=GEMINI_API_KEY)
-    # Lista de modelos em ordem de preferência (nomes oficiais sem prefixo)
+    genai.configure(api_key=GEMINI_API_KEY)
+    # Lista de modelos em ordem de preferência
     GEMINI_MODELS = [
-        "gemini-2.0-flash",
         "gemini-1.5-flash",
         "gemini-1.0-pro",
-        "gemini-pro",          # fallback mais antigo
+        "gemini-pro",
     ]
-    # Remove modelos que não estão disponíveis
-    _available_models = []
+    # Verifica quais modelos estão disponíveis
+    _available = []
     for model in GEMINI_MODELS:
         try:
-            # Testa se o modelo existe com uma chamada leve (apenas listagem)
-            # Como não há um método direto, tentamos gerar uma resposta curta
-            GEMINI_CLIENT.models.generate_content(
-                model=model,
-                contents="Teste"
-            )
-            _available_models.append(model)
+            genai.GenerativeModel(model)
+            _available.append(model)
         except Exception:
             continue
-    GEMINI_MODELS = _available_models if _available_models else ["gemini-pro"]
+    GEMINI_MODELS = _available if _available else ["gemini-pro"]
     print(f"🔍 Modelos Gemini disponíveis: {GEMINI_MODELS}")
 else:
-    GEMINI_CLIENT = None
     GEMINI_MODELS = []
 
 # Canal opcional para respostas automáticas (defina o ID ou None)
@@ -944,7 +941,7 @@ async def cmd_setup(itx: discord.Interaction):
     await itx.followup.send(f"✅ Painel criado em {ch.mention}!", ephemeral=True)
 
 
-# /setup_painel_remover — Admin  (NOVO)
+# /setup_painel_remover — Admin
 @bot.tree.command(name="setup_painel_remover", description="[ADMIN] Cria o painel de remoção de horas no canal configurado")
 @app_commands.default_permissions(administrator=True)
 async def cmd_setup_remove_panel(itx: discord.Interaction):
@@ -953,7 +950,6 @@ async def cmd_setup_remove_panel(itx: discord.Interaction):
     if not ch:
         return await itx.followup.send("❌ Canal de remoção não encontrado!", ephemeral=True)
 
-    # Remove mensagem antiga se existir
     old_mid = await load_mid("remove_panel")
     if old_mid:
         try:
@@ -980,7 +976,7 @@ async def cmd_setup_remove_panel(itx: discord.Interaction):
     await itx.followup.send(f"✅ Painel de remoção criado em {ch.mention}!", ephemeral=True)
 
 
-# /setup_recrutamento — Admin (NOVO)
+# /setup_recrutamento — Admin
 @bot.tree.command(name="setup_recrutamento", description="[ADMIN] Cria o painel de recrutamento no canal configurado")
 @app_commands.default_permissions(administrator=True)
 async def cmd_setup_recruit_panel(itx: discord.Interaction):
@@ -989,7 +985,6 @@ async def cmd_setup_recruit_panel(itx: discord.Interaction):
     if not ch:
         return await itx.followup.send("❌ Canal de recrutamento não encontrado!", ephemeral=True)
 
-    # Remove mensagem antiga se existir
     old_mid = await load_mid("recruit_panel")
     if old_mid:
         try:
@@ -1204,7 +1199,7 @@ async def cmd_pontos_abertos(itx: discord.Interaction):
     await itx.response.send_message(embed=e, ephemeral=True)
 
 
-# /remover_horas — com suporte a cargo + IDs fixos (mantido)
+# /remover_horas — com suporte a cargo + IDs fixos
 @bot.tree.command(
     name="remover_horas",
     description="[AUTORIZADO] Remove horas de uma sessão específica de um colaborador (via select)"
@@ -1213,7 +1208,6 @@ async def cmd_pontos_abertos(itx: discord.Interaction):
     colaborador="Colaborador cuja sessão será ajustada"
 )
 async def cmd_remover_horas(itx: discord.Interaction, colaborador: discord.Member):
-    # Permissão: cargo ou IDs fixos
     has_role = any(role.id in AUTHORIZED_REMOVE_ROLE_IDS for role in itx.user.roles)
     is_allowed = has_role or (itx.user.id in AUTHORIZED_REMOVE_IDS)
 
@@ -1291,17 +1285,16 @@ async def cmd_ajustar_horario(itx: discord.Interaction, colaborador: discord.Mem
 
 
 # ──────────────────────────────────────────────────────────────
-#  COMANDO /ia — Perguntar à IA (GEMINI com google.genai)
+#  COMANDO /ia — Perguntar à IA (GEMINI)
 # ──────────────────────────────────────────────────────────────
 @bot.tree.command(name="ia", description="Faça uma pergunta para a IA do Hospital ECCO")
 @app_commands.describe(pergunta="Sua pergunta para a IA")
 async def cmd_ia(itx: discord.Interaction, pergunta: str):
-    if not GEMINI_API_KEY or GEMINI_CLIENT is None:
+    if not GEMINI_API_KEY:
         return await itx.response.send_message(
             "❌ A IA não está configurada. Contate um administrador.",
             ephemeral=True
         )
-
     if not GEMINI_MODELS:
         return await itx.response.send_message(
             "❌ Nenhum modelo Gemini disponível. Verifique sua chave API.",
@@ -1321,10 +1314,8 @@ async def cmd_ia(itx: discord.Interaction, pergunta: str):
         ultimo_erro = None
         for modelo in GEMINI_MODELS:
             try:
-                resposta = GEMINI_CLIENT.models.generate_content(
-                    model=modelo,
-                    contents=f"{contexto}\n\nPergunta: {pergunta}"
-                )
+                model = genai.GenerativeModel(modelo)
+                resposta = model.generate_content(f"{contexto}\n\nPergunta: {pergunta}")
                 resposta_texto = resposta.text.strip()
                 break
             except Exception as e:
@@ -1350,7 +1341,7 @@ async def cmd_ia(itx: discord.Interaction, pergunta: str):
 
 
 # ──────────────────────────────────────────────────────────────
-#  VIEW — REMOVER HORAS (com select, usado pelo comando /remover_horas)
+#  VIEW — REMOVER HORAS (com select)
 # ──────────────────────────────────────────────────────────────
 
 class RemoveHoursModalSelect(discord.ui.Modal, title="Remover Horas da Sessão"):
@@ -1509,10 +1500,9 @@ async def on_message(msg: discord.Message):
 
     # Se o canal for o definido e não for um comando
     if IA_CHANNEL_ID and msg.channel.id == IA_CHANNEL_ID and not msg.content.startswith("!"):
-        if not GEMINI_API_KEY or GEMINI_CLIENT is None or not GEMINI_MODELS:
+        if not GEMINI_API_KEY or not GEMINI_MODELS:
             return
 
-        # Evita responder a comandos slash
         if msg.content.startswith("/"):
             return
 
@@ -1525,10 +1515,8 @@ async def on_message(msg: discord.Message):
                 resposta_texto = None
                 for modelo in GEMINI_MODELS:
                     try:
-                        resposta = GEMINI_CLIENT.models.generate_content(
-                            model=modelo,
-                            contents=f"{contexto}\n\nUsuário: {msg.content}"
-                        )
+                        model = genai.GenerativeModel(modelo)
+                        resposta = model.generate_content(f"{contexto}\n\nUsuário: {msg.content}")
                         resposta_texto = resposta.text.strip()
                         break
                     except Exception:
@@ -1549,7 +1537,6 @@ async def on_message(msg: discord.Message):
 async def on_ready():
     await init_db()
 
-    # Views persistentes
     bot.add_view(PunchView())
     bot.add_view(RemovePanelView())
     bot.add_view(RecruitView())
@@ -1570,7 +1557,7 @@ async def on_ready():
             await save_mid("panel", msg.id)
             print(f"📋 Painel criado no canal {PANEL_CHANNEL}")
     else:
-        print(f"⚠️  Canal do painel ({PANEL_CHANNEL}) não encontrado.")
+        print(f"⚠️ Canal do painel ({PANEL_CHANNEL}) não encontrado.")
 
     # Painel de remoção
     ch_remove = bot.get_channel(REMOVE_PANEL_CHANNEL)
@@ -1599,7 +1586,7 @@ async def on_ready():
             await save_mid("remove_panel", msg.id)
             print(f"📋 Painel de remoção criado no canal {REMOVE_PANEL_CHANNEL}")
     else:
-        print(f"⚠️  Canal de remoção ({REMOVE_PANEL_CHANNEL}) não encontrado.")
+        print(f"⚠️ Canal de remoção ({REMOVE_PANEL_CHANNEL}) não encontrado.")
 
     # Painel de recrutamento
     ch_recruit = bot.get_channel(RECRUIT_CHANNEL)
@@ -1628,12 +1615,12 @@ async def on_ready():
             await save_mid("recruit_panel", msg.id)
             print(f"📋 Painel de recrutamento criado no canal {RECRUIT_CHANNEL}")
     else:
-        print(f"⚠️  Canal de recrutamento ({RECRUIT_CHANNEL}) não encontrado.")
+        print(f"⚠️ Canal de recrutamento ({RECRUIT_CHANNEL}) não encontrado.")
 
     # Ranking
     ch_rank = bot.get_channel(RANK_CHANNEL)
     if not ch_rank:
-        print(f"⚠️  Canal de ranking ({RANK_CHANNEL}) não encontrado.")
+        print(f"⚠️ Canal de ranking ({RANK_CHANNEL}) não encontrado.")
     else:
         await refresh_rank(force=True)
         auto_refresh.start()
@@ -1643,12 +1630,12 @@ async def on_ready():
     try:
         synced = await bot.tree.sync()
         print(
-            f"✅  {bot.user} (ID: {bot.user.id}) online!\n"
+            f"✅ {bot.user} (ID: {bot.user.id}) online!\n"
             f"    {len(synced)} slash commands sincronizados\n"
             f"    {len(bot.guilds)} servidor(es)"
         )
     except Exception as exc:
-        print(f"❌  Erro ao sincronizar slash commands: {exc}")
+        print(f"❌ Erro ao sincronizar slash commands: {exc}")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1656,5 +1643,5 @@ async def on_ready():
 # ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     if not TOKEN:
-        raise SystemExit("❌  Defina a variável de ambiente DISCORD_TOKEN antes de iniciar o bot.")
+        raise SystemExit("❌ Defina a variável de ambiente DISCORD_TOKEN antes de iniciar o bot.")
     bot.run(TOKEN)
