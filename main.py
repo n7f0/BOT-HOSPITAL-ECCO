@@ -1,8 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║          ECCO HOSPITAL CENTER — BOT DE BATE PONTO           ║
-║            COM IA, MEMÓRIA E AGENDAMENTO DE LEMBRETES       ║
-║                 SUPORTE A MENÇÕES NA IA                     ║
+║         COM IA, MEMÓRIA, LEMBRETES E RESPOSTAS AUTOMÁTICAS  ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -55,8 +54,8 @@ if GEMINI_API_KEY:
 else:
     print("⚠️ Chave API Gemini não encontrada.")
 
-# Canal opcional para respostas automáticas (defina o ID ou None)
-IA_CHANNEL_ID = None  # Ex: 123456789012345678
+# Canal onde o bot responderá automaticamente (defina o ID ou None)
+IA_CHANNEL_ID = None  # Exemplo: 123456789012345678
 
 # ──────────────────────────────────────────────────────────────
 #  CONFIGURAÇÃO DO BOT
@@ -407,7 +406,6 @@ async def refresh_rank(force: bool = False):
 # ──────────────────────────────────────────────────────────────
 #  VIEWS — Bate Ponto, Remoção, Recrutamento, etc.
 # ──────────────────────────────────────────────────────────────
-# (Mantidas as mesmas classes que você já possui)
 class PunchView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -1103,18 +1101,11 @@ async def cmd_lembrar(
         )
 
 # ──────────────────────────────────────────────────────────────
-#  COMANDO /ia — com opção de mencionar
+#  COMANDO /ia — com contexto e memória
 # ──────────────────────────────────────────────────────────────
 @bot.tree.command(name="ia", description="Faça uma pergunta para a IA (com contexto do chat)")
-@app_commands.describe(
-    pergunta="Sua pergunta",
-    mencionar="Digite @everyone, @here ou mencione um usuário para adicionar no início da resposta (opcional)"
-)
-async def cmd_ia(
-    itx: discord.Interaction,
-    pergunta: str,
-    mencionar: str = None
-):
+@app_commands.describe(pergunta="Sua pergunta")
+async def cmd_ia(itx: discord.Interaction, pergunta: str):
     if not GEMINI_API_KEY:
         return await itx.response.send_message("❌ IA não configurada.", ephemeral=True)
     if not GEMINI_MODELS:
@@ -1193,29 +1184,12 @@ async def cmd_ia(
             response=resposta_texto
         )
 
-        # Processar menção
-        mencao_text = ""
-        if mencionar:
-            mencionar = mencionar.strip()
-            # Verificar se é @everyone ou @here
-            if mencionar.lower() in ["@everyone", "@here"]:
-                # Verificar permissão do usuário
-                if not itx.permissions.mention_everyone:
-                    return await itx.followup.send("❌ Você não tem permissão para mencionar @everyone ou @here.")
-                mencao_text = mencionar + " "
-            else:
-                # Tenta extrair menções de usuários do texto
-                # O usuário pode ter digitado @fulano, vamos pegar o texto como está
-                mencao_text = mencionar + " "
-
-        resposta_final = f"{mencao_text}{resposta_texto}"
-
-        if len(resposta_final) > 1900:
-            resposta_final = resposta_final[:1900] + "…"
+        if len(resposta_texto) > 1900:
+            resposta_texto = resposta_texto[:1900] + "…"
 
         embed = discord.Embed(
             title="🤖 Resposta da IA",
-            description=resposta_final,
+            description=resposta_texto,
             color=0x00D4FF,
         )
         embed.set_footer(text=f"Pergunta de {itx.user.display_name}", icon_url=itx.user.display_avatar.url)
@@ -1225,13 +1199,15 @@ async def cmd_ia(
         await itx.followup.send(f"❌ Erro: {str(e)[:200]}")
 
 # ──────────────────────────────────────────────────────────────
-#  EVENTO on_message (aprendizado contínuo)
+#  EVENTO on_message — RESPOSTAS AUTOMÁTICAS (sem comando)
 # ──────────────────────────────────────────────────────────────
 @bot.event
 async def on_message(msg: discord.Message):
+    # Ignora mensagens do próprio bot
     if msg.author.bot:
         return
 
+    # Se for no canal configurado e não for comando, responde automaticamente
     if IA_CHANNEL_ID and msg.channel.id == IA_CHANNEL_ID and not msg.content.startswith("!"):
         if not GEMINI_API_KEY or not GEMINI_MODELS:
             return
@@ -1240,13 +1216,18 @@ async def on_message(msg: discord.Message):
 
         async with msg.channel.typing():
             try:
+                # Busca histórico do canal para contexto
                 channel_history = await get_channel_history(str(msg.channel.id), limit=15)
+                user_history = await get_user_history(str(msg.author.id), limit=5)
+
                 contexto = (
-                    "Você é um assistente do Hospital ECCO. Responda de forma breve e útil. "
+                    "Você é um assistente do Hospital ECCO. Responda de forma breve e útil, "
+                    "como se fosse um profissional da saúde ajudando a equipe. "
                     "Máximo de 300 caracteres.\n\n"
                 )
+
                 if channel_history:
-                    contexto += "--- Histórico recente ---\n"
+                    contexto += "--- Histórico recente do canal ---\n"
                     for entry in channel_history:
                         uid, m, r, ts = entry
                         user = bot.get_user(int(uid))
@@ -1256,6 +1237,16 @@ async def on_message(msg: discord.Message):
                         else:
                             contexto += f"{nome}: {m}\n"
                     contexto += "\n"
+
+                if user_history:
+                    contexto += "--- Histórico do usuário ---\n"
+                    for entry in user_history:
+                        m, r, ts = entry
+                        contexto += f"Usuário: {m}\n"
+                        if r:
+                            contexto += f"Bot: {r}\n"
+                    contexto += "\n"
+
                 contexto += f"Usuário: {msg.content}"
 
                 resposta_texto = None
@@ -1267,6 +1258,7 @@ async def on_message(msg: discord.Message):
                         break
                     except Exception:
                         continue
+
                 if resposta_texto is None:
                     try:
                         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
@@ -1280,6 +1272,7 @@ async def on_message(msg: discord.Message):
                         pass
 
                 if resposta_texto:
+                    # Salva a conversa no banco
                     await save_conversation(
                         user_id=str(msg.author.id),
                         channel_id=str(msg.channel.id),
@@ -1287,9 +1280,11 @@ async def on_message(msg: discord.Message):
                         response=resposta_texto
                     )
                     await msg.reply(resposta_texto[:1900], mention_author=False)
-            except Exception:
-                pass
 
+            except Exception as e:
+                print(f"❌ Erro na resposta automática: {e}")
+
+    # Processa comandos
     await bot.process_commands(msg)
 
 # ──────────────────────────────────────────────────────────────
@@ -1343,6 +1338,7 @@ async def on_ready():
     bot.add_view(RemovePanelView())
     bot.add_view(RecruitView())
 
+    # Painel principal
     ch_panel = bot.get_channel(PANEL_CHANNEL)
     if ch_panel:
         mid_panel = await load_mid("panel")
@@ -1360,6 +1356,7 @@ async def on_ready():
     else:
         print(f"⚠️ Canal do painel ({PANEL_CHANNEL}) não encontrado.")
 
+    # Painel de remoção
     ch_remove = bot.get_channel(REMOVE_PANEL_CHANNEL)
     if ch_remove:
         mid_remove = await load_mid("remove_panel")
@@ -1388,6 +1385,7 @@ async def on_ready():
     else:
         print(f"⚠️ Canal de remoção ({REMOVE_PANEL_CHANNEL}) não encontrado.")
 
+    # Painel de recrutamento
     ch_recruit = bot.get_channel(RECRUIT_CHANNEL)
     if ch_recruit:
         mid_recruit = await load_mid("recruit_panel")
@@ -1416,6 +1414,7 @@ async def on_ready():
     else:
         print(f"⚠️ Canal de recrutamento ({RECRUIT_CHANNEL}) não encontrado.")
 
+    # Ranking
     ch_rank = bot.get_channel(RANK_CHANNEL)
     if not ch_rank:
         print(f"⚠️ Canal de ranking ({RANK_CHANNEL}) não encontrado.")
@@ -1426,15 +1425,13 @@ async def on_ready():
     notify_active_users.start()
     check_reminders.start()
 
-    try:
-        synced = await bot.tree.sync()
-        print(
-            f"✅ {bot.user} (ID: {bot.user.id}) online!\n"
-            f"    {len(synced)} slash commands sincronizados\n"
-            f"    {len(bot.guilds)} servidor(es)"
-        )
-    except Exception as exc:
-        print(f"❌ Erro ao sincronizar slash commands: {exc}")
+    print(f"✅ {bot.user} (ID: {bot.user.id}) online!")
+    print(f"   {len(bot.tree.get_commands())} slash commands sincronizados")
+    print(f"   {len(bot.guilds)} servidor(es)")
+    if IA_CHANNEL_ID:
+        print(f"   🤖 Respostas automáticas ativas no canal {IA_CHANNEL_ID}")
+    else:
+        print("   ⚠️ Respostas automáticas desativadas (defina IA_CHANNEL_ID)")
 
 # ──────────────────────────────────────────────────────────────
 #  ENTRY POINT
