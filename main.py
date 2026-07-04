@@ -101,7 +101,7 @@ _rank_lock   = asyncio.Lock()
 _last_update: float = 0.0
 
 # ──────────────────────────────────────────────────────────────
-#  DATABASE (com tabelas para IA e controle de canais)
+#  DATABASE
 # ──────────────────────────────────────────────────────────────
 async def init_db():
     db_dir = os.path.dirname(os.path.abspath(DB))
@@ -168,7 +168,7 @@ async def init_db():
             print("✅ Coluna 'response' adicionada à tabela conversation_history.")
 
 # ──────────────────────────────────────────────────────────────
-#  FUNÇÕES AUXILIARES PARA IA E LEMBRETES
+#  FUNÇÕES AUXILIARES
 # ──────────────────────────────────────────────────────────────
 async def save_conversation(user_id: str, channel_id: str, message: str, response: str = None):
     async with aiosqlite.connect(DB) as db:
@@ -235,6 +235,7 @@ async def set_ia_enabled(channel_id: str, enabled: bool):
             (channel_id, 1 if enabled else 0)
         )
         await db.commit()
+        print(f"✅ Canal {channel_id} {'ativado' if enabled else 'desativado'} para IA")
 
 # ──────────────────────────────────────────────────────────────
 #  TASK — VERIFICAR LEMBRETES
@@ -262,7 +263,7 @@ async def check_reminders():
         await mark_reminder_done(rid)
 
 # ──────────────────────────────────────────────────────────────
-#  FUNÇÕES EXISTENTES (bate ponto, ranking, etc.)
+#  FUNÇÕES EXISTENTES
 # ──────────────────────────────────────────────────────────────
 def now_br() -> datetime.datetime:
     return datetime.datetime.now(tz=BR_TZ)
@@ -850,6 +851,7 @@ async def cmd_ativar(itx: discord.Interaction):
         color=0x2ECC71
     )
     await itx.response.send_message(embed=embed, ephemeral=True)
+    print(f"✅ Canal {channel_id} ativado para IA por {itx.user.display_name}")
 
 @bot.tree.command(name="desativar", description="Desativa as respostas automáticas da IA neste canal")
 @app_commands.default_permissions(administrator=True)
@@ -862,6 +864,7 @@ async def cmd_desativar(itx: discord.Interaction):
         color=0xE74C3C
     )
     await itx.response.send_message(embed=embed, ephemeral=True)
+    print(f"❌ Canal {channel_id} desativado para IA por {itx.user.display_name}")
 
 @bot.tree.command(name="status_ia", description="Verifica se a IA está ativa neste canal")
 async def cmd_status_ia(itx: discord.Interaction):
@@ -874,6 +877,30 @@ async def cmd_status_ia(itx: discord.Interaction):
         color=0x2ECC71 if enabled else 0xE74C3C
     )
     embed.add_field(name="Comandos", value="Use `/ativar` para ligar e `/desativar` para desligar.", inline=False)
+    await itx.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="listar_canais_ia", description="[ADMIN] Lista todos os canais com IA ativa")
+@app_commands.default_permissions(administrator=True)
+async def cmd_listar_canais_ia(itx: discord.Interaction):
+    async with aiosqlite.connect(DB) as db:
+        async with db.execute("SELECT channel_id, enabled FROM ia_enabled_channels WHERE enabled = 1") as c:
+            rows = await c.fetchall()
+    
+    if not rows:
+        return await itx.response.send_message("ℹ️ Nenhum canal com IA ativa.", ephemeral=True)
+    
+    lines = []
+    for channel_id, enabled in rows:
+        channel = bot.get_channel(int(channel_id))
+        name = channel.mention if channel else f"ID: {channel_id}"
+        lines.append(f"• {name}")
+    
+    embed = discord.Embed(
+        title="📋 Canais com IA Ativa",
+        description="\n".join(lines) if lines else "Nenhum canal ativo.",
+        color=0x2ECC71
+    )
+    embed.set_footer(text=f"Total: {len(rows)} canal(is)")
     await itx.response.send_message(embed=embed, ephemeral=True)
 
 # ──────────────────────────────────────────────────────────────
@@ -1260,13 +1287,13 @@ async def cmd_ajustar_horario(itx: discord.Interaction, colaborador: discord.Mem
 # ──────────────────────────────────────────────────────────────
 @bot.event
 async def on_message(msg: discord.Message):
-    # Ignora mensagens do próprio bot
-    if msg.author.bot:
-        return
-
-    # Ignora comandos (com / ou !)
+    # Sempre processa comandos primeiro
     if msg.content.startswith(("/", "!")):
         await bot.process_commands(msg)
+        return
+
+    # Ignora mensagens do próprio bot
+    if msg.author.bot:
         return
 
     # Verifica se a IA está ativa neste canal
@@ -1283,13 +1310,13 @@ async def on_message(msg: discord.Message):
     # Processa a mensagem automaticamente
     async with msg.channel.typing():
         try:
-            # Busca histórico do canal (últimas 20 mensagens)
-            channel_history = await get_channel_history(str(msg.channel.id), limit=20)
+            # Busca histórico do canal (últimas 15 mensagens)
+            channel_history = await get_channel_history(str(msg.channel.id), limit=15)
 
             # Monta contexto com histórico
             contexto = (
                 "Você é um assistente virtual do Hospital ECCO em um servidor FiveM. "
-                "Responda de forma breve, educada e útil. Máximo de 500 caracteres. "
+                "Responda de forma breve, educada e útil. Máximo de 400 caracteres. "
                 "Seja direto e objetivo.\n\n"
             )
 
@@ -1345,10 +1372,9 @@ async def on_message(msg: discord.Message):
                     resposta_texto = resposta_texto[:1900] + "…"
                 await msg.reply(resposta_texto, mention_author=False)
 
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"❌ Erro no on_message: {e}")
 
-    # Processar comandos (caso tenha algum)
     await bot.process_commands(msg)
 
 # ──────────────────────────────────────────────────────────────
@@ -1402,6 +1428,7 @@ async def on_ready():
     bot.add_view(RemovePanelView())
     bot.add_view(RecruitView())
 
+    # Painel principal
     ch_panel = bot.get_channel(PANEL_CHANNEL)
     if ch_panel:
         mid_panel = await load_mid("panel")
@@ -1419,6 +1446,7 @@ async def on_ready():
     else:
         print(f"⚠️ Canal do painel ({PANEL_CHANNEL}) não encontrado.")
 
+    # Painel de remoção
     ch_remove = bot.get_channel(REMOVE_PANEL_CHANNEL)
     if ch_remove:
         mid_remove = await load_mid("remove_panel")
@@ -1447,6 +1475,7 @@ async def on_ready():
     else:
         print(f"⚠️ Canal de remoção ({REMOVE_PANEL_CHANNEL}) não encontrado.")
 
+    # Painel de recrutamento
     ch_recruit = bot.get_channel(RECRUIT_CHANNEL)
     if ch_recruit:
         mid_recruit = await load_mid("recruit_panel")
@@ -1475,6 +1504,7 @@ async def on_ready():
     else:
         print(f"⚠️ Canal de recrutamento ({RECRUIT_CHANNEL}) não encontrado.")
 
+    # Ranking
     ch_rank = bot.get_channel(RANK_CHANNEL)
     if not ch_rank:
         print(f"⚠️ Canal de ranking ({RANK_CHANNEL}) não encontrado.")
@@ -1485,15 +1515,17 @@ async def on_ready():
     notify_active_users.start()
     check_reminders.start()
 
+    # Sincronização de comandos
     try:
         synced = await bot.tree.sync()
-        print(
-            f"✅ {bot.user} (ID: {bot.user.id}) online!\n"
-            f"    {len(synced)} slash commands sincronizados\n"
-            f"    {len(bot.guilds)} servidor(es)"
-        )
+        print(f"✅ Comandos sincronizados: {len(synced)}")
+        for cmd in synced:
+            print(f"   /{cmd.name}")
     except Exception as exc:
-        print(f"❌ Erro ao sincronizar slash commands: {exc}")
+        print(f"❌ Erro ao sincronizar comandos: {exc}")
+
+    print(f"✅ {bot.user} (ID: {bot.user.id}) online!")
+    print(f"   {len(bot.guilds)} servidor(es)")
 
 # ──────────────────────────────────────────────────────────────
 #  ENTRY POINT
