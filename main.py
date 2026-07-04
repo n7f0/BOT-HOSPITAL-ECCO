@@ -1,7 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║          ECCO HOSPITAL CENTER — BOT DE BATE PONTO           ║
-║                     + IA GEMINI GRATUITA                    ║
+║                     + IA GEMINI (google.genai)              ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -34,6 +34,9 @@ if GEMINI_API_KEY:
 else:
     GEMINI_CLIENT = None
     GEMINI_MODELS = []
+
+# Canal opcional para respostas automáticas (defina o ID ou None)
+IA_CHANNEL_ID = None  # Exemplo: 123456789012345678
 
 # ──────────────────────────────────────────────────────────────
 #  CONFIGURAÇÃO DO BOT
@@ -1272,12 +1275,12 @@ async def cmd_ajustar_horario(itx: discord.Interaction, colaborador: discord.Mem
 
 
 # ──────────────────────────────────────────────────────────────
-#  COMANDO /ia — Perguntar à IA (GEMINI)
+#  COMANDO /ia — Perguntar à IA (GEMINI com google.genai)
 # ──────────────────────────────────────────────────────────────
 @bot.tree.command(name="ia", description="Faça uma pergunta para a IA do Hospital ECCO")
 @app_commands.describe(pergunta="Sua pergunta para a IA")
 async def cmd_ia(itx: discord.Interaction, pergunta: str):
-    if not GEMINI_API_KEY or GEMINI_MODEL is None:
+    if not GEMINI_API_KEY or GEMINI_CLIENT is None:
         return await itx.response.send_message(
             "❌ A IA não está configurada. Contate um administrador.",
             ephemeral=True
@@ -1292,15 +1295,30 @@ async def cmd_ia(itx: discord.Interaction, pergunta: str):
             "Responda de forma educada, objetiva e dentro do contexto hospitalar e de RPG. "
             "Máximo de 500 caracteres."
         )
-        resposta = GEMINI_MODEL.generate_content(f"{contexto}\n\nPergunta: {pergunta}")
-        texto = resposta.text.strip()
 
-        if len(texto) > 1900:
-            texto = texto[:1900] + "…"
+        resposta_texto = None
+        ultimo_erro = None
+        for modelo in GEMINI_MODELS:
+            try:
+                resposta = GEMINI_CLIENT.models.generate_content(
+                    model=modelo,
+                    contents=f"{contexto}\n\nPergunta: {pergunta}"
+                )
+                resposta_texto = resposta.text.strip()
+                break
+            except Exception as e:
+                ultimo_erro = e
+                continue
+
+        if resposta_texto is None:
+            raise Exception(f"Nenhum modelo disponível. Último erro: {ultimo_erro}")
+
+        if len(resposta_texto) > 1900:
+            resposta_texto = resposta_texto[:1900] + "…"
 
         embed = discord.Embed(
             title="🤖 Resposta da IA",
-            description=texto,
+            description=resposta_texto,
             color=0x00D4FF,
         )
         embed.set_footer(text=f"Pergunta de {itx.user.display_name}", icon_url=itx.user.display_avatar.url)
@@ -1470,7 +1488,7 @@ async def on_message(msg: discord.Message):
 
     # Se o canal for o definido e não for um comando
     if IA_CHANNEL_ID and msg.channel.id == IA_CHANNEL_ID and not msg.content.startswith("!"):
-        if not GEMINI_API_KEY or GEMINI_MODEL is None:
+        if not GEMINI_API_KEY or GEMINI_CLIENT is None:
             return
 
         # Evita responder a comandos slash (já tratados separadamente)
@@ -1483,10 +1501,19 @@ async def on_message(msg: discord.Message):
                     "Você é um assistente do Hospital ECCO em um servidor FiveM. "
                     "Responda de forma breve e útil. Máximo de 300 caracteres."
                 )
-                resposta = GEMINI_MODEL.generate_content(f"{contexto}\n\nUsuário: {msg.content}")
-                texto = resposta.text.strip()
-                if texto:
-                    await msg.reply(texto[:1900], mention_author=False)
+                resposta_texto = None
+                for modelo in GEMINI_MODELS:
+                    try:
+                        resposta = GEMINI_CLIENT.models.generate_content(
+                            model=modelo,
+                            contents=f"{contexto}\n\nUsuário: {msg.content}"
+                        )
+                        resposta_texto = resposta.text.strip()
+                        break
+                    except Exception:
+                        continue
+                if resposta_texto:
+                    await msg.reply(resposta_texto[:1900], mention_author=False)
             except Exception:
                 pass
 
