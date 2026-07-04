@@ -11,6 +11,7 @@ import os
 import time
 import re
 import warnings
+import requests
 
 import aiosqlite
 import discord
@@ -19,7 +20,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 # ──────────────────────────────────────────────────────────────
-#  CONFIGURAÇÃO DA IA (GEMINI - google-generativeai)
+#  CONFIGURAÇÃO DA IA (GEMINI)
 # ──────────────────────────────────────────────────────────────
 # Suprime aviso de depreciação (opcional)
 warnings.filterwarnings("ignore", category=FutureWarning, module="google.generativeai")
@@ -27,29 +28,38 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="google.generat
 import google.generativeai as genai
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    # Lista de modelos em ordem de preferência
-    GEMINI_MODELS = [
-        "gemini-1.5-flash",
-        "gemini-1.0-pro",
-        "gemini-pro",
-    ]
-    # Verifica quais modelos estão disponíveis
-    _available = []
-    for model in GEMINI_MODELS:
-        try:
-            genai.GenerativeModel(model)
-            _available.append(model)
-        except Exception:
-            continue
-    GEMINI_MODELS = _available if _available else ["gemini-pro"]
-    print(f"🔍 Modelos Gemini disponíveis: {GEMINI_MODELS}")
-else:
-    GEMINI_MODELS = []
+GEMINI_MODELS = []
 
-# Canal opcional para respostas automáticas (defina o ID ou None)
-IA_CHANNEL_ID = None  # Exemplo: 123456789012345678
+if GEMINI_API_KEY:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        # Lista todos os modelos disponíveis
+        available_models = []
+        for model in genai.list_models():
+            if "generateContent" in model.supported_generation_methods:
+                available_models.append(model.name)
+        # Filtra modelos Gemini
+        GEMINI_MODELS = [m for m in available_models if "gemini" in m]
+        if not GEMINI_MODELS:
+            # Fallback: modelos mais comuns
+            GEMINI_MODELS = [
+                "models/gemini-1.5-flash",
+                "models/gemini-1.0-pro",
+                "models/gemini-pro"
+            ]
+        print(f"🔍 Modelos Gemini disponíveis: {GEMINI_MODELS}")
+    except Exception as e:
+        print(f"❌ Erro ao configurar Gemini: {e}")
+        GEMINI_MODELS = [
+            "models/gemini-1.5-flash",
+            "models/gemini-1.0-pro",
+            "models/gemini-pro"
+        ]
+else:
+    print("⚠️ Chave API Gemini não encontrada.")
+
+# Canal opcional para respostas automáticas
+IA_CHANNEL_ID = None  # Defina o ID do canal ou deixe None
 
 # ──────────────────────────────────────────────────────────────
 #  CONFIGURAÇÃO DO BOT
@@ -1312,6 +1322,8 @@ async def cmd_ia(itx: discord.Interaction, pergunta: str):
 
         resposta_texto = None
         ultimo_erro = None
+
+        # 1. Tenta via SDK
         for modelo in GEMINI_MODELS:
             try:
                 model = genai.GenerativeModel(modelo)
@@ -1320,7 +1332,27 @@ async def cmd_ia(itx: discord.Interaction, pergunta: str):
                 break
             except Exception as e:
                 ultimo_erro = e
+                print(f"⚠️ Falha com modelo {modelo}: {e}")
                 continue
+
+        # 2. Fallback via REST API (se SDK falhar)
+        if resposta_texto is None:
+            try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+                payload = {
+                    "contents": [{
+                        "parts": [{"text": f"{contexto}\n\nPergunta: {pergunta}"}]
+                    }]
+                }
+                response = requests.post(url, json=payload, timeout=30)
+                if response.status_code == 200:
+                    data = response.json()
+                    if "candidates" in data and data["candidates"]:
+                        resposta_texto = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                else:
+                    ultimo_erro = f"API REST retornou {response.status_code}: {response.text}"
+            except Exception as e:
+                ultimo_erro = f"Fallback REST falhou: {e}"
 
         if resposta_texto is None:
             raise Exception(f"Nenhum modelo disponível. Último erro: {ultimo_erro}")
@@ -1513,6 +1545,7 @@ async def on_message(msg: discord.Message):
                     "Responda de forma breve e útil. Máximo de 300 caracteres."
                 )
                 resposta_texto = None
+                # Tenta via SDK
                 for modelo in GEMINI_MODELS:
                     try:
                         model = genai.GenerativeModel(modelo)
@@ -1521,6 +1554,18 @@ async def on_message(msg: discord.Message):
                         break
                     except Exception:
                         continue
+                # Fallback REST (opcional)
+                if resposta_texto is None:
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+                    payload = {
+                        "contents": [{"parts": [{"text": f"{contexto}\n\nUsuário: {msg.content}"}]}]
+                    }
+                    response = requests.post(url, json=payload, timeout=30)
+                    if response.status_code == 200:
+                        data = response.json()
+                        if "candidates" in data and data["candidates"]:
+                            resposta_texto = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
                 if resposta_texto:
                     await msg.reply(resposta_texto[:1900], mention_author=False)
             except Exception:
