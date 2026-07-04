@@ -25,12 +25,28 @@ from google import genai
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     GEMINI_CLIENT = genai.Client(api_key=GEMINI_API_KEY)
-    # Lista de modelos em ordem de preferência
+    # Lista de modelos em ordem de preferência (nomes oficiais sem prefixo)
     GEMINI_MODELS = [
-        "gemini-2.0-flash",   # mais recente e rápido
-        "gemini-1.5-flash",   # fallback
-        "gemini-1.0-pro"      # último fallback
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
+        "gemini-1.0-pro",
+        "gemini-pro",          # fallback mais antigo
     ]
+    # Remove modelos que não estão disponíveis
+    _available_models = []
+    for model in GEMINI_MODELS:
+        try:
+            # Testa se o modelo existe com uma chamada leve (apenas listagem)
+            # Como não há um método direto, tentamos gerar uma resposta curta
+            GEMINI_CLIENT.models.generate_content(
+                model=model,
+                contents="Teste"
+            )
+            _available_models.append(model)
+        except Exception:
+            continue
+    GEMINI_MODELS = _available_models if _available_models else ["gemini-pro"]
+    print(f"🔍 Modelos Gemini disponíveis: {GEMINI_MODELS}")
 else:
     GEMINI_CLIENT = None
     GEMINI_MODELS = []
@@ -1286,10 +1302,15 @@ async def cmd_ia(itx: discord.Interaction, pergunta: str):
             ephemeral=True
         )
 
+    if not GEMINI_MODELS:
+        return await itx.response.send_message(
+            "❌ Nenhum modelo Gemini disponível. Verifique sua chave API.",
+            ephemeral=True
+        )
+
     await itx.response.defer(ephemeral=False)
 
     try:
-        # Contexto personalizado para o hospital
         contexto = (
             "Você é um assistente virtual do Hospital ECCO em um servidor FiveM. "
             "Responda de forma educada, objetiva e dentro do contexto hospitalar e de RPG. "
@@ -1325,7 +1346,7 @@ async def cmd_ia(itx: discord.Interaction, pergunta: str):
         await itx.followup.send(embed=embed)
 
     except Exception as e:
-        await itx.followup.send(f"❌ Erro ao processar sua pergunta: {str(e)[:100]}")
+        await itx.followup.send(f"❌ Erro ao processar sua pergunta: {str(e)[:200]}")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1488,10 +1509,10 @@ async def on_message(msg: discord.Message):
 
     # Se o canal for o definido e não for um comando
     if IA_CHANNEL_ID and msg.channel.id == IA_CHANNEL_ID and not msg.content.startswith("!"):
-        if not GEMINI_API_KEY or GEMINI_CLIENT is None:
+        if not GEMINI_API_KEY or GEMINI_CLIENT is None or not GEMINI_MODELS:
             return
 
-        # Evita responder a comandos slash (já tratados separadamente)
+        # Evita responder a comandos slash
         if msg.content.startswith("/"):
             return
 
@@ -1517,7 +1538,7 @@ async def on_message(msg: discord.Message):
             except Exception:
                 pass
 
-    # Importante: processar comandos depois
+    # Processar comandos
     await bot.process_commands(msg)
 
 
@@ -1530,10 +1551,10 @@ async def on_ready():
 
     # Views persistentes
     bot.add_view(PunchView())
-    bot.add_view(RemovePanelView())   # Para o painel de remoção
-    bot.add_view(RecruitView())       # Para o painel de recrutamento
+    bot.add_view(RemovePanelView())
+    bot.add_view(RecruitView())
 
-    # Painel principal de ponto
+    # Painel principal
     ch_panel = bot.get_channel(PANEL_CHANNEL)
     if ch_panel:
         mid_panel = await load_mid("panel")
@@ -1551,7 +1572,7 @@ async def on_ready():
     else:
         print(f"⚠️  Canal do painel ({PANEL_CHANNEL}) não encontrado.")
 
-    # Painel de remoção (cria automaticamente se não existir)
+    # Painel de remoção
     ch_remove = bot.get_channel(REMOVE_PANEL_CHANNEL)
     if ch_remove:
         mid_remove = await load_mid("remove_panel")
@@ -1580,7 +1601,7 @@ async def on_ready():
     else:
         print(f"⚠️  Canal de remoção ({REMOVE_PANEL_CHANNEL}) não encontrado.")
 
-    # Painel de recrutamento (NOVO)
+    # Painel de recrutamento
     ch_recruit = bot.get_channel(RECRUIT_CHANNEL)
     if ch_recruit:
         mid_recruit = await load_mid("recruit_panel")
