@@ -3,7 +3,7 @@
 ║          ECCO HOSPITAL CENTER — BOT DE BATE PONTO           ║
 ║        COM IA, MEMÓRIA, APRENDIZADO CONTÍNUO E AVALIAÇÃO    ║
 ║           COMANDOS: /ativar_ia /desativar_ia /sync          ║
-║                     /lembrar /meu_ponto                     ║
+║                /lembrar (data/hora) /meu_ponto              ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -378,7 +378,7 @@ def remove_panel_embed() -> discord.Embed:
             "`/ativar_ia` - [Admin] Ativa a IA no canal atual.\n"
             "`/desativar_ia` - [Admin] Desativa a IA no canal.\n"
             "`/meu_ponto` - Consulte as suas horas trabalhadas nesta semana.\n"
-            "`/lembrar` - Define um lembrete (em minutos).\n"
+            "`/lembrar` - Define um lembrete com data/hora (DD/MM/AAAA HH:MM).\n"
             "`/sync` - [Admin] Sincroniza os comandos de barra do bot."
         ),
         color=0xE74C3C
@@ -830,18 +830,26 @@ async def cmd_meu_ponto(itx: discord.Interaction):
     e.add_field(name="⏱️ Total", value=f"**{hms(total)}**")
     await itx.response.send_message(embed=e, ephemeral=True)
 
-@bot.tree.command(name="lembrar", description="Define um lembrete (em minutos)")
-@app_commands.describe(tempo="Tempo em minutos até o lembrete", mensagem="Mensagem do lembrete")
-async def cmd_lembrar(itx: discord.Interaction, tempo: int, mensagem: str):
-    if tempo <= 0:
-        return await itx.response.send_message("❌ O tempo deve ser positivo.", ephemeral=True)
-    remind_at = now_br() + datetime.timedelta(minutes=tempo)
+# ─── NOVO COMANDO /lembrar com DATA E HORA ───
+@bot.tree.command(name="lembrar", description="Define um lembrete para uma data/hora específica (DD/MM/AAAA HH:MM)")
+@app_commands.describe(data_hora="Data e hora no formato DD/MM/AAAA HH:MM (ex: 25/12/2026 15:30)", mensagem="Mensagem do lembrete")
+async def cmd_lembrar(itx: discord.Interaction, data_hora: str, mensagem: str):
+    try:
+        remind_dt = datetime.datetime.strptime(data_hora, "%d/%m/%Y %H:%M")
+        remind_dt = BR_TZ.localize(remind_dt)
+    except ValueError:
+        return await itx.response.send_message("❌ Formato inválido. Use DD/MM/AAAA HH:MM (ex: 25/12/2026 15:30)", ephemeral=True)
+    
+    now = now_br()
+    if remind_dt <= now:
+        return await itx.response.send_message("❌ A data/hora deve ser no futuro.", ephemeral=True)
+    
     await db.execute(
         "INSERT INTO reminders (user_id, channel_id, message, remind_at) VALUES (?, ?, ?, ?)",
-        (str(itx.user.id), str(itx.channel_id), mensagem, remind_at.isoformat())
+        (str(itx.user.id), str(itx.channel_id), mensagem, remind_dt.isoformat())
     )
     await db.commit()
-    await itx.response.send_message(f"✅ Lembrete definido para daqui a {tempo} minutos.\n**Mensagem:** {mensagem}", ephemeral=True)
+    await itx.response.send_message(f"✅ Lembrete definido para **{remind_dt.strftime('%d/%m/%Y às %H:%M')}**.\n**Mensagem:** {mensagem}", ephemeral=True)
 
 @bot.tree.command(name="sync", description="[ADMIN] Sincroniza comandos")
 @app_commands.default_permissions(administrator=True)
