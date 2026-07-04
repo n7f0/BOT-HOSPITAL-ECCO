@@ -25,12 +25,13 @@ import google.generativeai as genai
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    GEMINI_MODEL = genai.GenerativeModel("gemini-1.5-flash")
+    try:
+        GEMINI_MODEL = genai.GenerativeModel("gemini-1.5-flash")
+    except Exception:
+        # Fallback para modelo mais antigo e amplamente disponível
+        GEMINI_MODEL = genai.GenerativeModel("gemini-1.0-pro")
 else:
     GEMINI_MODEL = None
-
-# Canal opcional para respostas automáticas (defina o ID ou None)
-IA_CHANNEL_ID = None  # Exemplo: 123456789012345678
 
 # ──────────────────────────────────────────────────────────────
 #  CONFIGURAÇÃO DO BOT
