@@ -2,7 +2,7 @@
 ╔══════════════════════════════════════════════════════════════╗
 ║          ECCO HOSPITAL CENTER — BOT DE BATE PONTO           ║
 ║            COM IA, MEMÓRIA E RESPOSTAS AUTOMÁTICAS          ║
-║                 CONTROLE POR CANAL (/ativar)                ║
+║           COMANDOS PERSONALIZADOS: /ativar_ia /desativar_ia ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -220,12 +220,11 @@ async def mark_reminder_done(reminder_id: int):
         await db.commit()
 
 async def is_ia_enabled(channel_id: str) -> bool:
-    """Verifica se a IA está ativada no canal."""
     async with aiosqlite.connect(DB) as db:
         async with db.execute("SELECT enabled FROM ia_enabled_channels WHERE channel_id = ?", (channel_id,)) as c:
             row = await c.fetchone()
     if row is None:
-        return False  # Desativado por padrão
+        return False
     return bool(row[0])
 
 async def set_ia_enabled(channel_id: str, enabled: bool):
@@ -838,29 +837,29 @@ class RemoveSessionView(discord.ui.View):
         await itx.response.send_modal(modal)
 
 # ──────────────────────────────────────────────────────────────
-#  COMANDOS DE CONTROLE DA IA POR CANAL
+#  COMANDOS DE CONTROLE DA IA
 # ──────────────────────────────────────────────────────────────
-@bot.tree.command(name="ativar", description="Ativa as respostas automáticas da IA neste canal")
+@bot.tree.command(name="ativar_ia", description="Ativa as respostas automáticas da IA neste canal")
 @app_commands.default_permissions(administrator=True)
-async def cmd_ativar(itx: discord.Interaction):
+async def cmd_ativar_ia(itx: discord.Interaction):
     channel_id = str(itx.channel_id)
     await set_ia_enabled(channel_id, True)
     embed = discord.Embed(
         title="✅ IA Ativada",
-        description=f"A IA agora vai responder automaticamente neste canal.\n\nUse `/desativar` para desligar.",
+        description=f"A IA agora vai responder automaticamente neste canal.\n\nUse `/desativar_ia` para desligar.",
         color=0x2ECC71
     )
     await itx.response.send_message(embed=embed, ephemeral=True)
     print(f"✅ Canal {channel_id} ativado para IA por {itx.user.display_name}")
 
-@bot.tree.command(name="desativar", description="Desativa as respostas automáticas da IA neste canal")
+@bot.tree.command(name="desativar_ia", description="Desativa as respostas automáticas da IA neste canal")
 @app_commands.default_permissions(administrator=True)
-async def cmd_desativar(itx: discord.Interaction):
+async def cmd_desativar_ia(itx: discord.Interaction):
     channel_id = str(itx.channel_id)
     await set_ia_enabled(channel_id, False)
     embed = discord.Embed(
         title="❌ IA Desativada",
-        description=f"A IA não vai mais responder automaticamente neste canal.\n\nUse `/ativar` para reativar.",
+        description=f"A IA não vai mais responder automaticamente neste canal.\n\nUse `/ativar_ia` para reativar.",
         color=0xE74C3C
     )
     await itx.response.send_message(embed=embed, ephemeral=True)
@@ -876,7 +875,7 @@ async def cmd_status_ia(itx: discord.Interaction):
         description=f"A IA está {status}.",
         color=0x2ECC71 if enabled else 0xE74C3C
     )
-    embed.add_field(name="Comandos", value="Use `/ativar` para ligar e `/desativar` para desligar.", inline=False)
+    embed.add_field(name="Comandos", value="Use `/ativar_ia` para ligar e `/desativar_ia` para desligar.", inline=False)
     await itx.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="listar_canais_ia", description="[ADMIN] Lista todos os canais com IA ativa")
@@ -885,16 +884,13 @@ async def cmd_listar_canais_ia(itx: discord.Interaction):
     async with aiosqlite.connect(DB) as db:
         async with db.execute("SELECT channel_id, enabled FROM ia_enabled_channels WHERE enabled = 1") as c:
             rows = await c.fetchall()
-    
     if not rows:
         return await itx.response.send_message("ℹ️ Nenhum canal com IA ativa.", ephemeral=True)
-    
     lines = []
     for channel_id, enabled in rows:
         channel = bot.get_channel(int(channel_id))
         name = channel.mention if channel else f"ID: {channel_id}"
         lines.append(f"• {name}")
-    
     embed = discord.Embed(
         title="📋 Canais com IA Ativa",
         description="\n".join(lines) if lines else "Nenhum canal ativo.",
@@ -902,6 +898,20 @@ async def cmd_listar_canais_ia(itx: discord.Interaction):
     )
     embed.set_footer(text=f"Total: {len(rows)} canal(is)")
     await itx.response.send_message(embed=embed, ephemeral=True)
+
+# ──────────────────────────────────────────────────────────────
+#  COMANDO /sync — Sincronização manual
+# ──────────────────────────────────────────────────────────────
+@bot.tree.command(name="sync", description="[ADMIN] Sincroniza os comandos do bot")
+@app_commands.default_permissions(administrator=True)
+async def cmd_sync(itx: discord.Interaction):
+    await itx.response.defer(ephemeral=True)
+    try:
+        synced = await bot.tree.sync()
+        await itx.followup.send(f"✅ Comandos sincronizados: {len(synced)}", ephemeral=True)
+        print(f"✅ Sincronização manual executada por {itx.user.display_name}")
+    except Exception as e:
+        await itx.followup.send(f"❌ Erro ao sincronizar: {e}", ephemeral=True)
 
 # ──────────────────────────────────────────────────────────────
 #  COMANDO /ia (manual)
@@ -1054,7 +1064,7 @@ async def cmd_lembrar(
         )
 
 # ──────────────────────────────────────────────────────────────
-#  COMANDOS EXISTENTES (bate ponto, ranking, etc.)
+#  COMANDOS DE BATE PONTO, RANKING, ETC.
 # ──────────────────────────────────────────────────────────────
 @bot.tree.command(name="setup_ponto", description="[ADMIN] Recria o painel de bate ponto")
 @app_commands.default_permissions(administrator=True)
@@ -1283,43 +1293,31 @@ async def cmd_ajustar_horario(itx: discord.Interaction, colaborador: discord.Mem
     await itx.response.send_message(embed=embed, view=view, ephemeral=True)
 
 # ──────────────────────────────────────────────────────────────
-#  EVENTO on_message — RESPOSTAS AUTOMÁTICAS EM CANAIS ATIVADOS
+#  EVENTO on_message — RESPOSTAS AUTOMÁTICAS
 # ──────────────────────────────────────────────────────────────
 @bot.event
 async def on_message(msg: discord.Message):
-    # Sempre processa comandos primeiro
     if msg.content.startswith(("/", "!")):
         await bot.process_commands(msg)
         return
-
-    # Ignora mensagens do próprio bot
     if msg.author.bot:
         return
-
-    # Verifica se a IA está ativa neste canal
     channel_id = str(msg.channel.id)
     if not await is_ia_enabled(channel_id):
         await bot.process_commands(msg)
         return
-
-    # Verifica se a IA está configurada
     if not GEMINI_API_KEY or not GEMINI_MODELS:
         await bot.process_commands(msg)
         return
 
-    # Processa a mensagem automaticamente
     async with msg.channel.typing():
         try:
-            # Busca histórico do canal (últimas 15 mensagens)
             channel_history = await get_channel_history(str(msg.channel.id), limit=15)
-
-            # Monta contexto com histórico
             contexto = (
                 "Você é um assistente virtual do Hospital ECCO em um servidor FiveM. "
                 "Responda de forma breve, educada e útil. Máximo de 400 caracteres. "
                 "Seja direto e objetivo.\n\n"
             )
-
             if channel_history:
                 contexto += "--- Histórico recente do canal ---\n"
                 for entry in channel_history:
@@ -1331,10 +1329,8 @@ async def on_message(msg: discord.Message):
                     else:
                         contexto += f"{nome}: {m}\n"
                 contexto += "\n"
-
             contexto += f"Usuário {msg.author.display_name}: {msg.content}"
 
-            # Gerar resposta com Gemini
             resposta_texto = None
             for modelo in GEMINI_MODELS:
                 try:
@@ -1345,7 +1341,6 @@ async def on_message(msg: discord.Message):
                 except Exception:
                     continue
 
-            # Fallback REST
             if resposta_texto is None:
                 try:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
@@ -1359,19 +1354,15 @@ async def on_message(msg: discord.Message):
                     pass
 
             if resposta_texto:
-                # Salvar conversa no banco
                 await save_conversation(
                     user_id=str(msg.author.id),
                     channel_id=str(msg.channel.id),
                     message=msg.content,
                     response=resposta_texto
                 )
-
-                # Enviar resposta
                 if len(resposta_texto) > 1900:
                     resposta_texto = resposta_texto[:1900] + "…"
                 await msg.reply(resposta_texto, mention_author=False)
-
         except Exception as e:
             print(f"❌ Erro no on_message: {e}")
 
@@ -1428,7 +1419,6 @@ async def on_ready():
     bot.add_view(RemovePanelView())
     bot.add_view(RecruitView())
 
-    # Painel principal
     ch_panel = bot.get_channel(PANEL_CHANNEL)
     if ch_panel:
         mid_panel = await load_mid("panel")
@@ -1446,7 +1436,6 @@ async def on_ready():
     else:
         print(f"⚠️ Canal do painel ({PANEL_CHANNEL}) não encontrado.")
 
-    # Painel de remoção
     ch_remove = bot.get_channel(REMOVE_PANEL_CHANNEL)
     if ch_remove:
         mid_remove = await load_mid("remove_panel")
@@ -1475,7 +1464,6 @@ async def on_ready():
     else:
         print(f"⚠️ Canal de remoção ({REMOVE_PANEL_CHANNEL}) não encontrado.")
 
-    # Painel de recrutamento
     ch_recruit = bot.get_channel(RECRUIT_CHANNEL)
     if ch_recruit:
         mid_recruit = await load_mid("recruit_panel")
@@ -1504,7 +1492,6 @@ async def on_ready():
     else:
         print(f"⚠️ Canal de recrutamento ({RECRUIT_CHANNEL}) não encontrado.")
 
-    # Ranking
     ch_rank = bot.get_channel(RANK_CHANNEL)
     if not ch_rank:
         print(f"⚠️ Canal de ranking ({RANK_CHANNEL}) não encontrado.")
@@ -1515,7 +1502,6 @@ async def on_ready():
     notify_active_users.start()
     check_reminders.start()
 
-    # Sincronização de comandos
     try:
         synced = await bot.tree.sync()
         print(f"✅ Comandos sincronizados: {len(synced)}")
