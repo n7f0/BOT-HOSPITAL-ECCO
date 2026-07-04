@@ -3,6 +3,7 @@
 ║          ECCO HOSPITAL CENTER — BOT DE BATE PONTO           ║
 ║        COM IA, MEMÓRIA, APRENDIZADO CONTÍNUO E AVALIAÇÃO    ║
 ║           COMANDOS: /ativar_ia /desativar_ia /sync          ║
+║                     /lembrar /meu_ponto                     ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -24,7 +25,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 # ──────────────────────────────────────────────────────────────
-#  CONFIGURAÇÃO DE LOGGING (Melhor Prática)
+#  CONFIGURAÇÃO DE LOGGING
 # ──────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -377,6 +378,7 @@ def remove_panel_embed() -> discord.Embed:
             "`/ativar_ia` - [Admin] Ativa a IA no canal atual.\n"
             "`/desativar_ia` - [Admin] Desativa a IA no canal.\n"
             "`/meu_ponto` - Consulte as suas horas trabalhadas nesta semana.\n"
+            "`/lembrar` - Define um lembrete (em minutos).\n"
             "`/sync` - [Admin] Sincroniza os comandos de barra do bot."
         ),
         color=0xE74C3C
@@ -828,6 +830,19 @@ async def cmd_meu_ponto(itx: discord.Interaction):
     e.add_field(name="⏱️ Total", value=f"**{hms(total)}**")
     await itx.response.send_message(embed=e, ephemeral=True)
 
+@bot.tree.command(name="lembrar", description="Define um lembrete (em minutos)")
+@app_commands.describe(tempo="Tempo em minutos até o lembrete", mensagem="Mensagem do lembrete")
+async def cmd_lembrar(itx: discord.Interaction, tempo: int, mensagem: str):
+    if tempo <= 0:
+        return await itx.response.send_message("❌ O tempo deve ser positivo.", ephemeral=True)
+    remind_at = now_br() + datetime.timedelta(minutes=tempo)
+    await db.execute(
+        "INSERT INTO reminders (user_id, channel_id, message, remind_at) VALUES (?, ?, ?, ?)",
+        (str(itx.user.id), str(itx.channel_id), mensagem, remind_at.isoformat())
+    )
+    await db.commit()
+    await itx.response.send_message(f"✅ Lembrete definido para daqui a {tempo} minutos.\n**Mensagem:** {mensagem}", ephemeral=True)
+
 @bot.tree.command(name="sync", description="[ADMIN] Sincroniza comandos")
 @app_commands.default_permissions(administrator=True)
 async def cmd_sync(itx: discord.Interaction):
@@ -866,7 +881,7 @@ async def on_ready():
     bot.add_view(PunchView())
     bot.add_view(RemovePanelView())
     bot.add_view(RecruitView())
-    bot.add_view(RecruitActionView()) # Adicionado para os botões de aprovar/recusar continuarem funcionando
+    bot.add_view(RecruitActionView())
 
     for ch_id, key, view_cls, emb_func in [
         (PANEL_CHANNEL, "panel", PunchView, panel_embed),
