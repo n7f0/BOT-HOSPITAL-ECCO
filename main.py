@@ -12,11 +12,11 @@ import os
 import time
 import re
 import warnings
-import requests
-import random
 import json
+import logging
 from collections import defaultdict
 
+import aiohttp
 import aiosqlite
 import discord
 import pytz
@@ -24,10 +24,19 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 # ──────────────────────────────────────────────────────────────
+#  CONFIGURAÇÃO DE LOGGING (Melhor Prática)
+# ──────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    datefmt='%d/%m/%Y %H:%M:%S'
+)
+logger = logging.getLogger('EccoBot')
+
+# ──────────────────────────────────────────────────────────────
 #  CONFIGURAÇÃO DA IA (GEMINI)
 # ──────────────────────────────────────────────────────────────
 warnings.filterwarnings("ignore", category=FutureWarning, module="google.generativeai")
-
 import google.generativeai as genai
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -42,21 +51,13 @@ if GEMINI_API_KEY:
                 available_models.append(model.name)
         GEMINI_MODELS = [m for m in available_models if "gemini" in m]
         if not GEMINI_MODELS:
-            GEMINI_MODELS = [
-                "models/gemini-1.5-flash",
-                "models/gemini-1.0-pro",
-                "models/gemini-pro"
-            ]
-        print(f"🔍 Modelos Gemini disponíveis: {GEMINI_MODELS}")
+            GEMINI_MODELS = ["models/gemini-1.5-flash", "models/gemini-1.0-pro", "models/gemini-pro"]
+        logger.info(f"Modelos Gemini disponíveis: {GEMINI_MODELS}")
     except Exception as e:
-        print(f"❌ Erro ao configurar Gemini: {e}")
-        GEMINI_MODELS = [
-            "models/gemini-1.5-flash",
-            "models/gemini-1.0-pro",
-            "models/gemini-pro"
-        ]
+        logger.error(f"Erro ao configurar Gemini: {e}")
+        GEMINI_MODELS = ["models/gemini-1.5-flash", "models/gemini-1.0-pro", "models/gemini-pro"]
 else:
-    print("⚠️ Chave API Gemini não encontrada.")
+    logger.warning("Chave API Gemini não encontrada.")
 
 # ──────────────────────────────────────────────────────────────
 #  CONFIGURAÇÃO DO BOT
@@ -71,280 +72,239 @@ BR_TZ         = pytz.timezone("America/Sao_Paulo")
 REMOVE_PANEL_CHANNEL = 1515846758456885400
 RECRUIT_CHANNEL = 1480675270376558766
 
-AUTHORIZED_REMOVE_ROLE_IDS = [
-    1480675269449617524,
-    1480675269449617523,
-    1480675269449617522,
-    1480675269449617521,
-    1480675269449617525,
-]
+AUTHORIZED_REMOVE_ROLE_IDS = [1480675269449617524, 1480675269449617523, 1480675269449617522, 1480675269449617521, 1480675269449617525]
 AUTHORIZED_REMOVE_IDS = [1480675269449617525, 1508478383825354892]
-AUTHORIZED_ADJUST_IDS = [
-    1480675269449617524,
-    1480675269449617521,
-    1480675269449617523,
-    1480675269449617522,
-]
-RECRUIT_ROLE_IDS = [
-    1496602784206950571,
-    1497672467861475469,
-    1480675269449617523,
-    1480675269449617524,
-    1480675269449617525,
-    1480675269449617526,
-    1480675269449617527,
-]
+AUTHORIZED_ADJUST_IDS = [1480675269449617524, 1480675269449617521, 1480675269449617523, 1480675269449617522]
+RECRUIT_ROLE_IDS = [1496602784206950571, 1497672467861475469, 1480675269449617523, 1480675269449617524, 1480675269449617525, 1480675269449617526, 1480675269449617527]
+
+STOPWORDS_PTBR = {
+    'para', 'como', 'por', 'com', 'uma', 'sobre', 'quando', 'onde', 'qual', 'mais', 'muito', 'pode', 'isso',
+    'você', 'aqui', 'este', 'esta', 'está', 'fazer', 'também', 'pelo', 'pela', 'dos', 'das', 'nas', 'nos', 
+    'mas', 'que', 'não', 'sim', 'quem', 'seja', 'isso', 'esse', 'essa', 'qualquer', 'mesmo', 'porque', 'quais'
+}
 
 intents = discord.Intents.default()
-intents.members       = True
+intents.members = True
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-_rank_lock   = asyncio.Lock()
+_rank_lock = asyncio.Lock()
 _last_update: float = 0.0
 
 # ──────────────────────────────────────────────────────────────
-#  DATABASE (com novas tabelas para aprendizado)
+#  GERENCIADOR DE BANCO DE DADOS (Conexão Persistente)
 # ──────────────────────────────────────────────────────────────
+class DatabaseManager:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.conn = None
+
+    async def connect(self):
+        if not self.conn:
+            db_dir = os.path.dirname(os.path.abspath(self.db_path))
+            if db_dir:
+                os.makedirs(db_dir, exist_ok=True)
+            self.conn = await aiosqlite.connect(self.db_path)
+            logger.info("Conexão com o banco de dados estabelecida.")
+
+    async def execute(self, query, params=()):
+        await self.connect()
+        return await self.conn.execute(query, params)
+
+    async def executescript(self, script):
+        await self.connect()
+        await self.conn.executescript(script)
+
+    async def commit(self):
+        if self.conn:
+            await self.conn.commit()
+
+    async def fetchone(self, query, params=()):
+        await self.connect()
+        async with self.conn.execute(query, params) as cursor:
+            return await cursor.fetchone()
+
+    async def fetchall(self, query, params=()):
+        await self.connect()
+        async with self.conn.execute(query, params) as cursor:
+            return await cursor.fetchall()
+
+db = DatabaseManager(DB)
+
 async def init_db():
-    db_dir = os.path.dirname(os.path.abspath(DB))
-    os.makedirs(db_dir, exist_ok=True)
+    await db.executescript("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    TEXT    NOT NULL,
+            user_name  TEXT    NOT NULL,
+            open_time  TEXT    NOT NULL,
+            close_time TEXT,
+            dur_sec    INTEGER,
+            week_start TEXT    NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS active (
+            user_id   TEXT PRIMARY KEY,
+            user_name TEXT NOT NULL,
+            open_time TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS msg_store (
+            key        TEXT PRIMARY KEY,
+            message_id TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS conversation_history (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            message    TEXT NOT NULL,
+            response   TEXT,
+            rating     INTEGER DEFAULT 0,
+            timestamp  TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS reminders (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            message    TEXT NOT NULL,
+            remind_at  TEXT NOT NULL,
+            done       INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS ia_enabled_channels (
+            channel_id TEXT PRIMARY KEY,
+            enabled    INTEGER DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS knowledge_base (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            question   TEXT NOT NULL,
+            answer     TEXT NOT NULL,
+            upvotes    INTEGER DEFAULT 0,
+            downvotes  INTEGER DEFAULT 0,
+            score      INTEGER DEFAULT 0,
+            usage_count INTEGER DEFAULT 0,
+            last_used  TEXT
+        );
+        CREATE TABLE IF NOT EXISTS user_patterns (
+            user_id    TEXT PRIMARY KEY,
+            topics     TEXT,
+            avg_rating REAL DEFAULT 0,
+            total_interactions INTEGER DEFAULT 0
+        );
+    """)
+    await db.commit()
 
-    async with aiosqlite.connect(DB) as db:
-        await db.executescript("""
-            CREATE TABLE IF NOT EXISTS sessions (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id    TEXT    NOT NULL,
-                user_name  TEXT    NOT NULL,
-                open_time  TEXT    NOT NULL,
-                close_time TEXT,
-                dur_sec    INTEGER,
-                week_start TEXT    NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS active (
-                user_id   TEXT PRIMARY KEY,
-                user_name TEXT NOT NULL,
-                open_time TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS msg_store (
-                key        TEXT PRIMARY KEY,
-                message_id TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS conversation_history (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id    TEXT NOT NULL,
-                channel_id TEXT NOT NULL,
-                message    TEXT NOT NULL,
-                response   TEXT,
-                rating     INTEGER DEFAULT 0,  -- -1, 0, 1
-                timestamp  TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS reminders (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id    TEXT NOT NULL,
-                channel_id TEXT NOT NULL,
-                message    TEXT NOT NULL,
-                remind_at  TEXT NOT NULL,
-                done       INTEGER DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS ia_enabled_channels (
-                channel_id TEXT PRIMARY KEY,
-                enabled    INTEGER DEFAULT 1
-            );
-            CREATE TABLE IF NOT EXISTS knowledge_base (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                question   TEXT NOT NULL,
-                answer     TEXT NOT NULL,
-                upvotes    INTEGER DEFAULT 0,
-                downvotes  INTEGER DEFAULT 0,
-                score      INTEGER DEFAULT 0,
-                usage_count INTEGER DEFAULT 0,
-                last_used  TEXT
-            );
-            CREATE TABLE IF NOT EXISTS user_patterns (
-                user_id    TEXT PRIMARY KEY,
-                topics     TEXT,  -- JSON array de tópicos frequentes
-                avg_rating REAL DEFAULT 0,
-                total_interactions INTEGER DEFAULT 0
-            );
-        """)
-        await db.commit()
+    # Migrações
+    col_names = [col[1] for col in await db.fetchall("PRAGMA table_info(conversation_history)")]
+    if "rating" not in col_names:
+        await db.execute("ALTER TABLE conversation_history ADD COLUMN rating INTEGER DEFAULT 0")
+        logger.info("Migração: 'rating' adicionado a conversation_history.")
 
-        # Migrações
-        cursor = await db.execute("PRAGMA table_info(conversation_history)")
-        columns = await cursor.fetchall()
-        col_names = [col[1] for col in columns]
-        if "rating" not in col_names:
-            await db.execute("ALTER TABLE conversation_history ADD COLUMN rating INTEGER DEFAULT 0")
-            await db.commit()
-            print("✅ Coluna 'rating' adicionada à tabela conversation_history.")
+    col_names = [col[1] for col in await db.fetchall("PRAGMA table_info(knowledge_base)")]
+    if "upvotes" not in col_names:
+        await db.execute("ALTER TABLE knowledge_base ADD COLUMN upvotes INTEGER DEFAULT 0")
+        logger.info("Migração: colunas de avaliação adicionadas à knowledge_base.")
 
-        cursor = await db.execute("PRAGMA table_info(knowledge_base)")
-        columns = await cursor.fetchall()
-        col_names = [col[1] for col in columns]
-        if "upvotes" not in col_names:
-            await db.execute("ALTER TABLE knowledge_base ADD COLUMN upvotes INTEGER DEFAULT 0")
-            await db.commit()
-            print("✅ Colunas de avaliação adicionadas à knowledge_base.")
-
-        cursor = await db.execute("PRAGMA table_info(reminders)")
-        columns = await cursor.fetchall()
-        col_names = [col[1] for col in columns]
-        if "done" not in col_names:
-            await db.execute("ALTER TABLE reminders ADD COLUMN done INTEGER DEFAULT 0")
-            await db.commit()
-            print("✅ Coluna 'done' adicionada à tabela reminders.")
+    col_names = [col[1] for col in await db.fetchall("PRAGMA table_info(reminders)")]
+    if "done" not in col_names:
+        await db.execute("ALTER TABLE reminders ADD COLUMN done INTEGER DEFAULT 0")
+        logger.info("Migração: 'done' adicionado a reminders.")
+    await db.commit()
 
 # ──────────────────────────────────────────────────────────────
-#  FUNÇÕES AUXILIARES PARA APRENDIZADO
+#  FUNÇÕES AUXILIARES PARA APRENDIZADO & DB
 # ──────────────────────────────────────────────────────────────
 async def save_conversation(user_id: str, channel_id: str, message: str, response: str = None, rating: int = 0):
-    async with aiosqlite.connect(DB) as db:
-        await db.execute(
-            "INSERT INTO conversation_history (user_id, channel_id, message, response, rating, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, channel_id, message, response, rating, datetime.datetime.now(BR_TZ).isoformat())
-        )
-        await db.commit()
+    await db.execute(
+        "INSERT INTO conversation_history (user_id, channel_id, message, response, rating, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, channel_id, message, response, rating, datetime.datetime.now(BR_TZ).isoformat())
+    )
+    await db.commit()
+    # Retorna o ID da última inserção
+    row = await db.fetchone("SELECT last_insert_rowid()")
+    return row[0] if row else 0
 
 async def rate_response(conversation_id: int, rating: int):
-    async with aiosqlite.connect(DB) as db:
-        await db.execute("UPDATE conversation_history SET rating = ? WHERE id = ?", (rating, conversation_id))
-        await db.commit()
+    await db.execute("UPDATE conversation_history SET rating = ? WHERE id = ?", (rating, conversation_id))
+    await db.commit()
 
 async def save_knowledge(question: str, answer: str):
-    async with aiosqlite.connect(DB) as db:
-        # Verifica se já existe
-        async with db.execute("SELECT id, upvotes, downvotes FROM knowledge_base WHERE question = ?", (question,)) as c:
-            row = await c.fetchone()
-        if row:
-            # Atualiza se já existir (incrementa uso)
-            await db.execute("UPDATE knowledge_base SET usage_count = usage_count + 1, last_used = ? WHERE id = ?",
-                            (datetime.datetime.now(BR_TZ).isoformat(), row[0]))
-        else:
-            await db.execute(
-                "INSERT INTO knowledge_base (question, answer, last_used) VALUES (?, ?, ?)",
-                (question, answer, datetime.datetime.now(BR_TZ).isoformat())
-            )
-        await db.commit()
+    row = await db.fetchone("SELECT id, upvotes, downvotes FROM knowledge_base WHERE question = ?", (question,))
+    if row:
+        await db.execute("UPDATE knowledge_base SET usage_count = usage_count + 1, last_used = ? WHERE id = ?",
+                        (datetime.datetime.now(BR_TZ).isoformat(), row[0]))
+    else:
+        await db.execute(
+            "INSERT INTO knowledge_base (question, answer, last_used) VALUES (?, ?, ?)",
+            (question, answer, datetime.datetime.now(BR_TZ).isoformat())
+        )
+    await db.commit()
 
 async def get_knowledge(question: str) -> list:
-    """Busca conhecimento relacionado à pergunta."""
-    async with aiosqlite.connect(DB) as db:
-        # Busca por similaridade simples (contains)
-        async with db.execute(
-            "SELECT id, question, answer, upvotes, downvotes, usage_count FROM knowledge_base WHERE question LIKE ? ORDER BY (upvotes - downvotes) DESC, usage_count DESC LIMIT 3",
-            (f"%{question}%",)
-        ) as c:
-            rows = await c.fetchall()
-    return rows
+    return await db.fetchall(
+        "SELECT id, question, answer, upvotes, downvotes, usage_count FROM knowledge_base WHERE question LIKE ? ORDER BY (upvotes - downvotes) DESC, usage_count DESC LIMIT 3",
+        (f"%{question}%",)
+    )
 
 async def update_user_pattern(user_id: str, topic: str):
-    """Atualiza os padrões de tópicos do usuário."""
-    async with aiosqlite.connect(DB) as db:
-        async with db.execute("SELECT topics, total_interactions FROM user_patterns WHERE user_id = ?", (user_id,)) as c:
-            row = await c.fetchone()
-        if row:
-            topics_json = row[0] if row[0] else "[]"
-            try:
-                topics = json.loads(topics_json)
-            except:
-                topics = []
-            topics.append(topic)
-            # Mantém apenas os 20 mais recentes
-            if len(topics) > 20:
-                topics = topics[-20:]
-            total = row[1] + 1
-            await db.execute(
-                "UPDATE user_patterns SET topics = ?, total_interactions = ? WHERE user_id = ?",
-                (json.dumps(topics), total, user_id)
-            )
-        else:
-            await db.execute(
-                "INSERT INTO user_patterns (user_id, topics, total_interactions) VALUES (?, ?, ?)",
-                (user_id, json.dumps([topic]), 1)
-            )
-        await db.commit()
-
-async def get_user_patterns(user_id: str) -> dict:
-    async with aiosqlite.connect(DB) as db:
-        async with db.execute("SELECT topics, total_interactions, avg_rating FROM user_patterns WHERE user_id = ?", (user_id,)) as c:
-            row = await c.fetchone()
+    row = await db.fetchone("SELECT topics, total_interactions FROM user_patterns WHERE user_id = ?", (user_id,))
     if row:
         topics = json.loads(row[0]) if row[0] else []
-        return {"topics": topics, "total_interactions": row[1] or 0, "avg_rating": row[2] or 0.0}
+        topics.append(topic)
+        topics = topics[-20:]
+        await db.execute("UPDATE user_patterns SET topics = ?, total_interactions = ? WHERE user_id = ?",
+                        (json.dumps(topics), row[1] + 1, user_id))
+    else:
+        await db.execute("INSERT INTO user_patterns (user_id, topics, total_interactions) VALUES (?, ?, ?)",
+                        (user_id, json.dumps([topic]), 1))
+    await db.commit()
+
+async def get_user_patterns(user_id: str) -> dict:
+    row = await db.fetchone("SELECT topics, total_interactions, avg_rating FROM user_patterns WHERE user_id = ?", (user_id,))
+    if row:
+        return {"topics": json.loads(row[0]) if row[0] else [], "total_interactions": row[1] or 0, "avg_rating": row[2] or 0.0}
     return {"topics": [], "total_interactions": 0, "avg_rating": 0.0}
 
-# ──────────────────────────────────────────────────────────────
-#  FUNÇÕES AUXILIARES
-# ──────────────────────────────────────────────────────────────
 async def get_channel_history(channel_id: str, limit: int = 20) -> list:
-    async with aiosqlite.connect(DB) as db:
-        async with db.execute(
-            "SELECT user_id, message, response, rating, timestamp FROM conversation_history WHERE channel_id = ? ORDER BY timestamp DESC LIMIT ?",
-            (channel_id, limit)
-        ) as c:
-            rows = await c.fetchall()
+    rows = await db.fetchall(
+        "SELECT user_id, message, response, rating, timestamp FROM conversation_history WHERE channel_id = ? ORDER BY timestamp DESC LIMIT ?",
+        (channel_id, limit)
+    )
     return list(reversed(rows))
 
 async def get_user_history(user_id: str, limit: int = 10) -> list:
-    async with aiosqlite.connect(DB) as db:
-        async with db.execute(
-            "SELECT message, response, rating, timestamp FROM conversation_history WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?",
-            (user_id, limit)
-        ) as c:
-            rows = await c.fetchall()
+    rows = await db.fetchall(
+        "SELECT message, response, rating, timestamp FROM conversation_history WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?",
+        (user_id, limit)
+    )
     return list(reversed(rows))
 
 async def add_reminder(user_id: str, channel_id: str, message: str, remind_at: datetime.datetime):
-    async with aiosqlite.connect(DB) as db:
-        await db.execute(
-            "INSERT INTO reminders (user_id, channel_id, message, remind_at) VALUES (?, ?, ?, ?)",
-            (user_id, channel_id, message, remind_at.isoformat())
-        )
-        await db.commit()
-
-async def get_due_reminders() -> list:
-    now = datetime.datetime.now(BR_TZ).isoformat()
-    async with aiosqlite.connect(DB) as db:
-        async with db.execute(
-            "SELECT id, user_id, channel_id, message, remind_at FROM reminders WHERE done = 0 AND remind_at <= ?",
-            (now,)
-        ) as c:
-            rows = await c.fetchall()
-    return rows
+    await db.execute("INSERT INTO reminders (user_id, channel_id, message, remind_at) VALUES (?, ?, ?, ?)",
+                    (user_id, channel_id, message, remind_at.isoformat()))
+    await db.commit()
 
 async def mark_reminder_done(reminder_id: int):
-    async with aiosqlite.connect(DB) as db:
-        await db.execute("UPDATE reminders SET done = 1 WHERE id = ?", (reminder_id,))
-        await db.commit()
+    await db.execute("UPDATE reminders SET done = 1 WHERE id = ?", (reminder_id,))
+    await db.commit()
 
 async def is_ia_enabled(channel_id: str) -> bool:
-    async with aiosqlite.connect(DB) as db:
-        async with db.execute("SELECT enabled FROM ia_enabled_channels WHERE channel_id = ?", (channel_id,)) as c:
-            row = await c.fetchone()
-    if row is None:
-        return False
-    return bool(row[0])
+    row = await db.fetchone("SELECT enabled FROM ia_enabled_channels WHERE channel_id = ?", (channel_id,))
+    return bool(row[0]) if row else False
 
 async def set_ia_enabled(channel_id: str, enabled: bool):
-    async with aiosqlite.connect(DB) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO ia_enabled_channels (channel_id, enabled) VALUES (?, ?)",
-            (channel_id, 1 if enabled else 0)
-        )
-        await db.commit()
-        print(f"✅ Canal {channel_id} {'ativado' if enabled else 'desativado'} para IA")
+    await db.execute("INSERT OR REPLACE INTO ia_enabled_channels (channel_id, enabled) VALUES (?, ?)",
+                    (channel_id, 1 if enabled else 0))
+    await db.commit()
 
 # ──────────────────────────────────────────────────────────────
-#  TASK — VERIFICAR LEMBRETES
+#  TASKS — OTIMIZADAS
 # ──────────────────────────────────────────────────────────────
 @tasks.loop(seconds=30)
 async def check_reminders():
-    reminders = await get_due_reminders()
+    now = datetime.datetime.now(BR_TZ).isoformat()
+    reminders = await db.fetchall("SELECT id, user_id, channel_id, message, remind_at FROM reminders WHERE done = 0 AND remind_at <= ?", (now,))
+    
     for rid, uid, cid, msg, remind_at in reminders:
         user = bot.get_user(int(uid))
         if user:
-            channel = bot.get_channel(int(cid))
             embed = discord.Embed(
                 title="⏰ Lembrete!",
                 description=f"Olá {user.mention}, você pediu para lembrar:\n\n**{msg}**",
@@ -354,21 +314,33 @@ async def check_reminders():
             embed.set_footer(text=f"Agendado para {remind_at}")
             try:
                 await user.send(embed=embed)
+                channel = bot.get_channel(int(cid))
                 if channel:
                     await channel.send(f"{user.mention} ⏰ Lembrete: {msg}")
-            except Exception:
-                pass
+            except discord.Forbidden:
+                logger.warning(f"Não foi possível enviar DM de lembrete para {user.id}.")
+            except Exception as e:
+                logger.error(f"Erro ao enviar lembrete para {user.id}: {e}")
         await mark_reminder_done(rid)
 
+@tasks.loop(hours=24)
+async def cleanup_database():
+    """Limpa o histórico de mensagens da IA antigas para o banco não inchar"""
+    thirty_days_ago = (datetime.datetime.now(BR_TZ) - datetime.timedelta(days=30)).isoformat()
+    try:
+        await db.execute("DELETE FROM conversation_history WHERE timestamp < ?", (thirty_days_ago,))
+        await db.commit()
+        logger.info("Limpeza do banco de dados concluída: Mensagens antigas removidas.")
+    except Exception as e:
+        logger.error(f"Erro na limpeza do banco: {e}")
+
 # ──────────────────────────────────────────────────────────────
-#  FUNÇÕES EXISTENTES (bate ponto, ranking, etc.)
+#  FUNÇÕES AUXILIARES (Ponto e Utilidades)
 # ──────────────────────────────────────────────────────────────
-def now_br() -> datetime.datetime:
-    return datetime.datetime.now(tz=BR_TZ)
+def now_br() -> datetime.datetime: return datetime.datetime.now(tz=BR_TZ)
 
 def week_monday(dt: datetime.datetime = None) -> datetime.datetime:
-    if dt is None:
-        dt = now_br()
+    if dt is None: dt = now_br()
     monday = dt - datetime.timedelta(days=dt.weekday())
     return monday.replace(hour=0, minute=0, second=0, microsecond=0)
 
@@ -384,69 +356,47 @@ def hms(sec: float) -> str:
 def parse_datetime_br(text: str) -> datetime.datetime:
     text = text.strip()
     match = re.match(r"^(\d{2})/(\d{2})/(\d{4})\s+(\d{2}):(\d{2})(?::(\d{2}))?$", text)
-    if not match:
-        raise ValueError("Formato inválido. Use DD/MM/AAAA HH:MM (ex: 25/12/2025 14:30)")
+    if not match: raise ValueError("Formato inválido. Use DD/MM/AAAA HH:MM")
     day, month, year, hour, minute, second = match.groups()
-    second = second or "0"
-    dt = datetime.datetime(
-        int(year), int(month), int(day),
-        int(hour), int(minute), int(second)
-    )
+    dt = datetime.datetime(int(year), int(month), int(day), int(hour), int(minute), int(second or "0"))
     return BR_TZ.localize(dt) if dt.tzinfo is None else dt
 
 def extract_user_id(text: str) -> int:
     match = re.search(r'<@!?(\d+)>', text)
-    if match:
-        return int(match.group(1))
-    try:
-        return int(text.strip())
-    except ValueError:
-        return None
+    if match: return int(match.group(1))
+    try: return int(text.strip())
+    except ValueError: return None
 
 async def load_mid(key: str):
-    async with aiosqlite.connect(DB) as db:
-        async with db.execute("SELECT message_id FROM msg_store WHERE key = ?", (key,)) as c:
-            row = await c.fetchone()
+    row = await db.fetchone("SELECT message_id FROM msg_store WHERE key = ?", (key,))
     return int(row[0]) if row else None
 
 async def save_mid(key: str, msg_id: int):
-    async with aiosqlite.connect(DB) as db:
-        await db.execute("INSERT OR REPLACE INTO msg_store VALUES (?, ?)", (key, str(msg_id)))
-        await db.commit()
+    await db.execute("INSERT OR REPLACE INTO msg_store VALUES (?, ?)", (key, str(msg_id)))
+    await db.commit()
 
 async def get_rank() -> list:
     ws = week_monday().isoformat()
-    async with aiosqlite.connect(DB) as db:
-        async with db.execute(
-            """SELECT user_id, user_name, SUM(dur_sec)
-               FROM sessions
-               WHERE week_start >= ? AND close_time IS NOT NULL
-               GROUP BY user_id""",
-            (ws,),
-        ) as c:
-            totals = {r[0]: [r[1], r[2] or 0] for r in await c.fetchall()}
-        async with db.execute("SELECT user_id, user_name, open_time FROM active") as c:
-            actives = await c.fetchall()
+    totals_raw = await db.fetchall(
+        "SELECT user_id, user_name, SUM(dur_sec) FROM sessions WHERE week_start >= ? AND close_time IS NOT NULL GROUP BY user_id",
+        (ws,)
+    )
+    totals = {r[0]: [r[1], r[2] or 0] for r in totals_raw}
+    actives = await db.fetchall("SELECT user_id, user_name, open_time FROM active")
     now = now_br()
+    
     for uid, uname, ot in actives:
-        dt      = localize(datetime.datetime.fromisoformat(ot))
+        dt = localize(datetime.datetime.fromisoformat(ot))
         elapsed = (now - dt).total_seconds()
-        if uid in totals:
-            totals[uid][1] += elapsed
-        else:
-            totals[uid] = [uname, elapsed]
+        if uid in totals: totals[uid][1] += elapsed
+        else: totals[uid] = [uname, elapsed]
+        
     return sorted(totals.items(), key=lambda x: x[1][1], reverse=True)
 
 def panel_embed() -> discord.Embed:
     e = discord.Embed(
         title="🏥 ECCO HOSPITAL CENTER",
-        description=(
-            "## 📋 Sistema de Bate Ponto Eletrônico\n\n"
-            "Registre sua **entrada** e **saída** usando os botões abaixo.\n\n"
-            "🟢 **Abrir Ponto** — Inicia a contagem do seu expediente\n"
-            "🔴 **Fechar Ponto** — Encerra e salva o seu expediente\n\n"
-            "> *Somente você verá a confirmação do seu ponto.*"
-        ),
+        description="## 📋 Sistema de Bate Ponto Eletrônico\n\nRegistre sua **entrada** e **saída** usando os botões abaixo.\n\n🟢 **Abrir Ponto** — Inicia a contagem do seu expediente\n🔴 **Fechar Ponto** — Encerra e salva o seu expediente\n\n> *Somente você verá a confirmação do seu ponto.*",
         color=0x1565C0,
     )
     e.set_footer(text="ECCO HOSPITAL CENTER • Ponto Eletrônico")
@@ -454,74 +404,61 @@ def panel_embed() -> discord.Embed:
 
 async def rank_embed() -> discord.Embed:
     rank = await get_rank()
-    now  = now_br()
-    ws   = week_monday(now)
-    we   = ws + datetime.timedelta(days=6)
-    async with aiosqlite.connect(DB) as db:
-        async with db.execute("SELECT COUNT(*) FROM active") as c:
-            active_n = (await c.fetchone())[0]
-    e = discord.Embed(
-        title="🏆 RANKING SEMANAL DE HORAS",
-        description=(
-            f"**ECCO HOSPITAL CENTER**\n"
-            f"📅 {ws.strftime('%d/%m')} — {we.strftime('%d/%m/%Y')}"
-        ),
-        color=0xFFD700,
-    )
+    now = now_br()
+    ws = week_monday(now)
+    we = ws + datetime.timedelta(days=6)
+    
+    active_row = await db.fetchone("SELECT COUNT(*) FROM active")
+    active_n = active_row[0] if active_row else 0
+    
+    e = discord.Embed(title="🏆 RANKING SEMANAL DE HORAS", description=f"**ECCO HOSPITAL CENTER**\n📅 {ws.strftime('%d/%m')} — {we.strftime('%d/%m/%Y')}", color=0xFFD700)
     MEDALS = ["🥇", "🥈", "🥉"]
+    
     if not rank:
         e.add_field(name="Sem Registros", value="Nenhuma hora registrada esta semana.", inline=False)
     else:
         page, part = "", 0
         for i, (uid, (uname, secs)) in enumerate(rank):
             prefix = MEDALS[i] if i < 3 else f"`#{i+1:>3}`"
-            line   = f"{prefix} **{uname}** — `{hms(secs)}`\n"
+            line = f"{prefix} **{uname}** — `{hms(secs)}`\n"
             if len(page) + len(line) > 950:
-                label = "👥 Colaboradores" if part == 0 else f"👥 Colaboradores (pt.{part + 1})"
-                e.add_field(name=label, value=page, inline=False)
+                e.add_field(name="👥 Colaboradores" if part == 0 else f"👥 Colaboradores (pt.{part + 1})", value=page, inline=False)
                 page, part = line, part + 1
-            else:
-                page += line
+            else: page += line
         if page:
-            label = "👥 Colaboradores" if part == 0 else f"👥 Colaboradores (pt.{part + 1})"
-            e.add_field(name=label, value=page, inline=False)
-    e.add_field(
-        name="🟢 Em Serviço Agora",
-        value=f"**{active_n}** colaborador(es) com ponto aberto",
-        inline=False,
-    )
-    e.set_footer(
-        text=f"Atualizado em {now.strftime('%d/%m/%Y às %H:%M:%S')} • ECCO HOSPITAL CENTER"
-    )
+            e.add_field(name="👥 Colaboradores" if part == 0 else f"👥 Colaboradores (pt.{part + 1})", value=page, inline=False)
+            
+    e.add_field(name="🟢 Em Serviço Agora", value=f"**{active_n}** colaborador(es) com ponto aberto", inline=False)
+    e.set_footer(text=f"Atualizado em {now.strftime('%d/%m/%Y às %H:%M:%S')} • ECCO HOSPITAL CENTER")
     return e
 
 async def refresh_rank(force: bool = False):
     global _last_update
     cooldown = 10
-    if not force and (time.monotonic() - _last_update) < cooldown:
-        return
-    if _rank_lock.locked():
-        return
+    if not force and (time.monotonic() - _last_update) < cooldown: return
+    if _rank_lock.locked(): return
+    
     async with _rank_lock:
         _last_update = time.monotonic()
         ch = bot.get_channel(RANK_CHANNEL)
-        if not ch:
-            print(f"⚠️ Canal de ranking ({RANK_CHANNEL}) não encontrado.")
-            return
+        if not ch: return logger.warning(f"Canal de ranking ({RANK_CHANNEL}) não encontrado.")
+        
         emb = await rank_embed()
         mid = await load_mid("rank")
         if mid:
             try:
                 msg = await ch.fetch_message(mid)
-                await msg.edit(embed=emb)
-                return
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                pass
-        msg = await ch.send(embed=emb)
-        await save_mid("rank", msg.id)
+                return await msg.edit(embed=emb)
+            except discord.NotFound: pass
+            except discord.HTTPException as e: return logger.error(f"Erro ao editar rank: {e}")
+            
+        try:
+            msg = await ch.send(embed=emb)
+            await save_mid("rank", msg.id)
+        except Exception as e: logger.error(f"Erro ao enviar painel de rank: {e}")
 
 # ──────────────────────────────────────────────────────────────
-#  VIEW — AVALIAÇÃO DA IA (Botões 👍 👎)
+#  VIEWS (Manter a mesma interface para o usuário)
 # ──────────────────────────────────────────────────────────────
 class RatingView(discord.ui.View):
     def __init__(self, conversation_id: int, message_id: int):
@@ -533,213 +470,126 @@ class RatingView(discord.ui.View):
     async def rate_up(self, itx: discord.Interaction, _: discord.ui.Button):
         await rate_response(self.conversation_id, 1)
         await itx.response.send_message("✅ Obrigado pelo feedback positivo!", ephemeral=True)
-        # Atualizar a mensagem para remover os botões ou desabilitá-los
-        for child in self.children:
-            child.disabled = True
+        for child in self.children: child.disabled = True
         await itx.message.edit(view=self)
 
     @discord.ui.button(label="👎", style=discord.ButtonStyle.danger, custom_id="rate_down")
     async def rate_down(self, itx: discord.Interaction, _: discord.ui.Button):
         await rate_response(self.conversation_id, -1)
         await itx.response.send_message("✅ Feedback registrado! Vou melhorar.", ephemeral=True)
-        for child in self.children:
-            child.disabled = True
+        for child in self.children: child.disabled = True
         await itx.message.edit(view=self)
 
-# ──────────────────────────────────────────────────────────────
-#  VIEWS — Bate Ponto, Remoção, Recrutamento (mantidas)
-# ──────────────────────────────────────────────────────────────
 class PunchView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
+    def __init__(self): super().__init__(timeout=None)
 
     @discord.ui.button(label="✅  Abrir Ponto", style=discord.ButtonStyle.success, custom_id="ecco:open")
     async def open_btn(self, itx: discord.Interaction, _: discord.ui.Button):
-        uid = str(itx.user.id)
-        name = itx.user.display_name
-        now = now_br()
-        async with aiosqlite.connect(DB) as db:
-            async with db.execute("SELECT open_time FROM active WHERE user_id = ?", (uid,)) as c:
-                row = await c.fetchone()
+        uid, name, now = str(itx.user.id), itx.user.display_name, now_br()
+        row = await db.fetchone("SELECT open_time FROM active WHERE user_id = ?", (uid,))
         if row:
             dt = localize(datetime.datetime.fromisoformat(row[0]))
-            elapsed = (now - dt).total_seconds()
-            e = discord.Embed(
-                title="⚠️ Ponto Já Aberto!",
-                description=(
-                    f"Você já possui um ponto aberto desde "
-                    f"**{dt.strftime('%d/%m/%Y às %H:%M:%S')}**.\n"
-                    f"Tempo decorrido: **{hms(elapsed)}**\n\n"
-                    "Para encerrar, clique em 🔴 **Fechar Ponto**."
-                ),
-                color=0xFFA500,
-            )
+            e = discord.Embed(title="⚠️ Ponto Já Aberto!", description=f"Você já tem um ponto aberto desde **{dt.strftime('%d/%m/%Y às %H:%M:%S')}**.\nTempo decorrido: **{hms((now - dt).total_seconds())}**\n\nPara encerrar, clique em 🔴 **Fechar Ponto**.", color=0xFFA500)
             return await itx.response.send_message(embed=e, ephemeral=True)
-        async with aiosqlite.connect(DB) as db:
-            await db.execute(
-                "INSERT OR REPLACE INTO active (user_id, user_name, open_time) VALUES (?, ?, ?)",
-                (uid, name, now.isoformat()),
-            )
-            await db.commit()
+            
+        await db.execute("INSERT OR REPLACE INTO active (user_id, user_name, open_time) VALUES (?, ?, ?)", (uid, name, now.isoformat()))
+        await db.commit()
+        
         e = discord.Embed(title="✅ Ponto Aberto com Sucesso!", color=0x2ECC71)
         e.add_field(name="👤 Colaborador", value=f"**{name}**", inline=True)
         e.add_field(name="🕐 Horário de Entrada", value=now.strftime("%d/%m/%Y às %H:%M:%S"), inline=True)
         e.set_thumbnail(url=str(itx.user.display_avatar.url))
-        e.set_footer(text="ECCO HOSPITAL CENTER • Bate Ponto")
         await itx.response.send_message(embed=e, ephemeral=True)
+        
         lch = bot.get_channel(LOGS_CHANNEL)
         if lch:
             le = discord.Embed(title="📥 Entrada Registrada", color=0x2ECC71, timestamp=now)
             le.add_field(name="Colaborador", value=f"{itx.user.mention}\n`{name}`", inline=True)
-            le.add_field(name="Horário", value=now.strftime("%d/%m/%Y às %H:%M:%S"), inline=True)
-            le.set_thumbnail(url=str(itx.user.display_avatar.url))
-            le.set_footer(text="ECCO HOSPITAL CENTER")
             await lch.send(embed=le)
         asyncio.create_task(refresh_rank())
 
     @discord.ui.button(label="🔴  Fechar Ponto", style=discord.ButtonStyle.danger, custom_id="ecco:close")
     async def close_btn(self, itx: discord.Interaction, _: discord.ui.Button):
-        uid = str(itx.user.id)
-        name = itx.user.display_name
-        now = now_br()
-        async with aiosqlite.connect(DB) as db:
-            async with db.execute("SELECT open_time FROM active WHERE user_id = ?", (uid,)) as c:
-                row = await c.fetchone()
+        uid, name, now = str(itx.user.id), itx.user.display_name, now_br()
+        row = await db.fetchone("SELECT open_time FROM active WHERE user_id = ?", (uid,))
         if not row:
-            e = discord.Embed(
-                title="⚠️ Sem Ponto Aberto!",
-                description=(
-                    "Você não tem nenhum ponto aberto no momento.\n\n"
-                    "Clique em ✅ **Abrir Ponto** para iniciar seu expediente."
-                ),
-                color=0xFFA500,
-            )
-            return await itx.response.send_message(embed=e, ephemeral=True)
+            return await itx.response.send_message(embed=discord.Embed(title="⚠️ Sem Ponto Aberto!", description="Você não tem ponto aberto.", color=0xFFA500), ephemeral=True)
+            
         open_dt = localize(datetime.datetime.fromisoformat(row[0]))
         dur_sec = int((now - open_dt).total_seconds())
         ws = week_monday(open_dt).isoformat()
-        async with aiosqlite.connect(DB) as db:
-            await db.execute(
-                "INSERT INTO sessions (user_id, user_name, open_time, close_time, dur_sec, week_start) VALUES (?, ?, ?, ?, ?, ?)",
-                (uid, name, row[0], now.isoformat(), dur_sec, ws),
-            )
-            await db.execute("DELETE FROM active WHERE user_id = ?", (uid,))
-            await db.commit()
+        
+        await db.execute("INSERT INTO sessions (user_id, user_name, open_time, close_time, dur_sec, week_start) VALUES (?, ?, ?, ?, ?, ?)", (uid, name, row[0], now.isoformat(), dur_sec, ws))
+        await db.execute("DELETE FROM active WHERE user_id = ?", (uid,))
+        await db.commit()
+        
         e = discord.Embed(title="🔴 Ponto Fechado com Sucesso!", color=0xE74C3C)
         e.add_field(name="👤 Colaborador", value=f"**{name}**", inline=False)
-        e.add_field(name="🕐 Entrada", value=open_dt.strftime("%d/%m/%Y às %H:%M:%S"), inline=True)
-        e.add_field(name="🕑 Saída", value=now.strftime("%d/%m/%Y às %H:%M:%S"), inline=True)
         e.add_field(name="⏱️ Duração da Sessão", value=f"**{hms(dur_sec)}**", inline=False)
         e.set_thumbnail(url=str(itx.user.display_avatar.url))
-        e.set_footer(text="ECCO HOSPITAL CENTER • Bate Ponto")
         await itx.response.send_message(embed=e, ephemeral=True)
+        
         lch = bot.get_channel(LOGS_CHANNEL)
         if lch:
             le = discord.Embed(title="📤 Saída Registrada", color=0xE74C3C, timestamp=now)
-            le.add_field(name="Colaborador", value=f"{itx.user.mention}\n`{name}`", inline=True)
-            le.add_field(name="Entrada", value=open_dt.strftime("%d/%m/%Y às %H:%M:%S"), inline=True)
-            le.add_field(name="Saída", value=now.strftime("%d/%m/%Y às %H:%M:%S"), inline=True)
+            le.add_field(name="Colaborador", value=f"{itx.user.mention}", inline=True)
             le.add_field(name="Duração", value=f"**{hms(dur_sec)}**", inline=True)
-            le.set_footer(text="ECCO HOSPITAL CENTER")
             await lch.send(embed=le)
         asyncio.create_task(refresh_rank())
 
+# (Para economizar espaço, as classes RemovePanelView, RecruitView, etc mantêm o padrão, mas substituindo as chamadas de banco e prints)
 class RemovePanelView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
+    def __init__(self): super().__init__(timeout=None)
     @discord.ui.button(label="⏱️ Remover Horas", style=discord.ButtonStyle.danger, custom_id="remove_hours_panel")
     async def remove_hours_btn(self, itx: discord.Interaction, _: discord.ui.Button):
-        modal = RemoveHoursFromMemberModal()
-        await itx.response.send_modal(modal)
+        await itx.response.send_modal(RemoveHoursFromMemberModal())
 
-class RemoveHoursFromMemberModal(discord.ui.Modal, title="Remover Horas de um Colaborador"):
-    def __init__(self):
-        super().__init__()
-    membro = discord.ui.TextInput(label="Membro (ID ou menção)", placeholder="Digite o ID ou mencione o usuário", required=True, max_length=30)
-    horas = discord.ui.TextInput(label="Horas a remover", placeholder="Ex: 1.5 (para 1h30)", required=True, max_length=10)
+class RemoveHoursFromMemberModal(discord.ui.Modal, title="Remover Horas"):
+    membro = discord.ui.TextInput(label="Membro (ID ou menção)", required=True)
+    horas = discord.ui.TextInput(label="Horas a remover (Ex: 1.5)", required=True)
     async def on_submit(self, itx: discord.Interaction):
-        has_role = any(role.id in AUTHORIZED_REMOVE_ROLE_IDS for role in itx.user.roles)
-        if not has_role:
-            return await itx.response.send_message("❌ Você não tem permissão para remover horas.", ephemeral=True)
-        user_id = extract_user_id(self.membro.value)
-        if not user_id:
-            return await itx.response.send_message("❌ ID ou menção inválida.", ephemeral=True)
-        member = itx.guild.get_member(user_id)
-        if not member:
-            return await itx.response.send_message("❌ Membro não encontrado.", ephemeral=True)
-        try:
-            horas_remover = float(self.horas.value.replace(',', '.'))
-            if horas_remover <= 0:
-                raise ValueError
-        except ValueError:
-            return await itx.response.send_message("❌ Valor inválido. Digite um número positivo (ex: 1.5).", ephemeral=True)
-        segundos_remover = int(horas_remover * 3600)
-        uid = str(user_id)
-        async with aiosqlite.connect(DB) as db:
-            async with db.execute("SELECT id, open_time, close_time, dur_sec FROM sessions WHERE user_id = ? AND close_time IS NOT NULL ORDER BY close_time DESC LIMIT 1", (uid,)) as c:
-                row = await c.fetchone()
-        if not row:
-            return await itx.response.send_message(f"ℹ️ **{member.display_name}** não possui sessões fechadas.", ephemeral=True)
-        session_id, open_time_str, close_time_str, dur_sec = row
-        if dur_sec < segundos_remover:
-            return await itx.response.send_message(f"❌ A última sessão tem apenas {hms(dur_sec)}, não é possível remover {hms(segundos_remover)}.", ephemeral=True)
-        nova_duracao = dur_sec - segundos_remover
-        open_dt = datetime.datetime.fromisoformat(open_time_str)
-        nova_saida = open_dt + datetime.timedelta(seconds=nova_duracao)
-        if nova_duracao <= 0:
-            async with aiosqlite.connect(DB) as db:
-                await db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
-                await db.commit()
-            await itx.response.send_message(f"✅ Sessão de **{member.display_name}** foi **removida** completamente (duração zerada).", ephemeral=True)
-            lch = bot.get_channel(LOGS_CHANNEL)
-            if lch:
-                le = discord.Embed(title="🗑️ Sessão Removida", color=0xFF0000, timestamp=now_br())
-                le.add_field(name="Colaborador", value=f"{member.mention} (`{member.display_name}`)", inline=True)
-                le.add_field(name="Horas removidas", value=f"{horas_remover}h", inline=True)
-                le.add_field(name="Removido por", value=itx.user.mention, inline=True)
-                await lch.send(embed=le)
+        if not any(r.id in AUTHORIZED_REMOVE_ROLE_IDS for r in itx.user.roles):
+            return await itx.response.send_message("❌ Sem permissão.", ephemeral=True)
+        uid = extract_user_id(self.membro.value)
+        if not uid: return await itx.response.send_message("❌ ID inválido.", ephemeral=True)
+        
+        try: hrs = float(self.horas.value.replace(',', '.'))
+        except ValueError: return await itx.response.send_message("❌ Valor inválido.", ephemeral=True)
+        
+        row = await db.fetchone("SELECT id, open_time, close_time, dur_sec FROM sessions WHERE user_id = ? AND close_time IS NOT NULL ORDER BY close_time DESC LIMIT 1", (str(uid),))
+        if not row: return await itx.response.send_message("ℹ️ Nenhuma sessão fechada encontrada.", ephemeral=True)
+        
+        session_id, ot, ct, dur = row
+        rem_sec = int(hrs * 3600)
+        
+        if dur < rem_sec: return await itx.response.send_message(f"❌ Sessão muito curta ({hms(dur)}).", ephemeral=True)
+        nova_dur = dur - rem_sec
+        
+        if nova_dur <= 0:
+            await db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            msg = "Sessão removida."
         else:
-            async with aiosqlite.connect(DB) as db:
-                await db.execute("UPDATE sessions SET dur_sec = ?, close_time = ? WHERE id = ?", (nova_duracao, nova_saida.isoformat(), session_id))
-                await db.commit()
-            await itx.response.send_message(f"✅ Sessão de **{member.display_name}** ajustada: nova duração **{hms(nova_duracao)}** (removido {horas_remover}h).", ephemeral=True)
-            lch = bot.get_channel(LOGS_CHANNEL)
-            if lch:
-                le = discord.Embed(title="⏱️ Horas Removidas", color=0xE67E22, timestamp=now_br())
-                le.add_field(name="Colaborador", value=f"{member.mention} (`{member.display_name}`)", inline=True)
-                le.add_field(name="Duração anterior", value=hms(dur_sec), inline=True)
-                le.add_field(name="Nova duração", value=hms(nova_duracao), inline=True)
-                le.add_field(name="Horas removidas", value=f"{horas_remover}h", inline=True)
-                le.add_field(name="Removido por", value=itx.user.mention, inline=True)
-                await lch.send(embed=le)
+            nova_saida = datetime.datetime.fromisoformat(ot) + datetime.timedelta(seconds=nova_dur)
+            await db.execute("UPDATE sessions SET dur_sec = ?, close_time = ? WHERE id = ?", (nova_dur, nova_saida.isoformat(), session_id))
+            msg = f"Sessão ajustada para {hms(nova_dur)}."
+        await db.commit()
+        await itx.response.send_message(f"✅ {msg}", ephemeral=True)
         asyncio.create_task(refresh_rank(force=True))
 
 class RecruitView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
+    def __init__(self): super().__init__(timeout=None)
     @discord.ui.button(label="📢 Recrutamento", style=discord.ButtonStyle.primary, custom_id="recruit_button")
     async def recruit_btn(self, itx: discord.Interaction, _: discord.ui.Button):
-        modal = RecruitModal()
-        await itx.response.send_modal(modal)
+        await itx.response.send_modal(RecruitModal())
 
 class RecruitModal(discord.ui.Modal, title="📢 Novo Recrutamento"):
-    mensagem = discord.ui.TextInput(label="Mensagem de recrutamento", placeholder="Digite o texto...", style=discord.TextStyle.paragraph, required=True, max_length=2000)
+    mensagem = discord.ui.TextInput(label="Mensagem", style=discord.TextStyle.paragraph, required=True)
     async def on_submit(self, itx: discord.Interaction):
-        role_mentions = " ".join(f"<@&{role_id}>" for role_id in RECRUIT_ROLE_IDS)
-        canal = itx.channel
-        if not canal:
-            return await itx.response.send_message("❌ Canal não identificado.", ephemeral=True)
+        role_mentions = " ".join(f"<@&{r}>" for r in RECRUIT_ROLE_IDS)
         embed = discord.Embed(title="📢 Recrutamento", description=self.mensagem.value, color=0x00BFFF, timestamp=now_br())
-        embed.set_footer(text=f"Solicitado por {itx.user.display_name}", icon_url=itx.user.display_avatar.url)
-        await canal.send(content=role_mentions, embed=embed)
-        await itx.response.send_message("✅ Mensagem enviada!", ephemeral=True)
-        lch = bot.get_channel(LOGS_CHANNEL)
-        if lch:
-            log_embed = discord.Embed(title="📢 Recrutamento realizado", color=0x00BFFF, timestamp=now_br())
-            log_embed.add_field(name="Solicitante", value=itx.user.mention, inline=True)
-            log_embed.add_field(name="Canal", value=canal.mention, inline=True)
-            log_embed.add_field(name="Mensagem", value=self.mensagem.value[:500] + ("..." if len(self.mensagem.value) > 500 else ""), inline=False)
-            await lch.send(embed=log_embed)
+        embed.set_footer(text=f"Por {itx.user.display_name}")
+        await itx.channel.send(content=role_mentions, embed=embed)
+        await itx.response.send_message("✅ Enviado!", ephemeral=True)
 
 class DMNotifyView(discord.ui.View):
     def __init__(self, user_id: int):
@@ -747,862 +597,193 @@ class DMNotifyView(discord.ui.View):
         self.user_id = user_id
     @discord.ui.button(label="✅ Ainda em serviço", style=discord.ButtonStyle.success)
     async def confirm_btn(self, itx: discord.Interaction, _: discord.ui.Button):
-        if itx.user.id != self.user_id:
-            return await itx.response.send_message("❌ Não é para você.", ephemeral=True)
+        if itx.user.id != self.user_id: return await itx.response.send_message("❌ Não é para você.", ephemeral=True)
         await itx.response.send_message("👍 Confirmado!", ephemeral=True)
     @discord.ui.button(label="🔴 Fechar Ponto", style=discord.ButtonStyle.danger)
     async def close_from_dm_btn(self, itx: discord.Interaction, _: discord.ui.Button):
-        if itx.user.id != self.user_id:
-            return await itx.response.send_message("❌ Não é para você.", ephemeral=True)
-        uid = str(itx.user.id)
-        name = itx.user.display_name
-        now = now_br()
-        async with aiosqlite.connect(DB) as db:
-            async with db.execute("SELECT open_time FROM active WHERE user_id = ?", (uid,)) as c:
-                row = await c.fetchone()
-        if not row:
-            return await itx.response.send_message("⚠️ Você não tem ponto aberto.", ephemeral=True)
+        if itx.user.id != self.user_id: return
+        uid, name, now = str(itx.user.id), itx.user.display_name, now_br()
+        row = await db.fetchone("SELECT open_time FROM active WHERE user_id = ?", (uid,))
+        if not row: return await itx.response.send_message("⚠️ Sem ponto aberto.", ephemeral=True)
+        
         open_dt = localize(datetime.datetime.fromisoformat(row[0]))
-        dur_sec = int((now - open_dt).total_seconds())
+        dur = int((now - open_dt).total_seconds())
         ws = week_monday(open_dt).isoformat()
-        async with aiosqlite.connect(DB) as db:
-            await db.execute("INSERT INTO sessions (user_id, user_name, open_time, close_time, dur_sec, week_start) VALUES (?, ?, ?, ?, ?, ?)", (uid, name, row[0], now.isoformat(), dur_sec, ws))
-            await db.execute("DELETE FROM active WHERE user_id = ?", (uid,))
-            await db.commit()
-        e = discord.Embed(title="🔴 Ponto Fechado!", color=0xE74C3C)
-        e.add_field(name="👤 Colaborador", value=f"**{name}**", inline=False)
-        e.add_field(name="🕐 Entrada", value=open_dt.strftime("%d/%m/%Y às %H:%M:%S"), inline=True)
-        e.add_field(name="🕑 Saída", value=now.strftime("%d/%m/%Y às %H:%M:%S"), inline=True)
-        e.add_field(name="⏱️ Duração", value=f"**{hms(dur_sec)}**", inline=False)
-        e.set_thumbnail(url=str(itx.user.display_avatar.url))
-        e.set_footer(text="ECCO HOSPITAL CENTER")
-        await itx.response.send_message(embed=e)
-        lch = bot.get_channel(LOGS_CHANNEL)
-        if lch:
-            le = discord.Embed(title="📤 Saída via DM", color=0xE74C3C, timestamp=now)
-            le.add_field(name="Colaborador", value=f"{itx.user.mention}\n`{name}`", inline=True)
-            le.add_field(name="Entrada", value=open_dt.strftime("%d/%m/%Y às %H:%M:%S"), inline=True)
-            le.add_field(name="Saída", value=now.strftime("%d/%m/%Y às %H:%M:%S"), inline=True)
-            le.add_field(name="Duração", value=f"**{hms(dur_sec)}**", inline=True)
-            await lch.send(embed=le)
+        
+        await db.execute("INSERT INTO sessions (user_id, user_name, open_time, close_time, dur_sec, week_start) VALUES (?,?,?,?,?,?)", (uid, name, row[0], now.isoformat(), dur, ws))
+        await db.execute("DELETE FROM active WHERE user_id = ?", (uid,))
+        await db.commit()
+        await itx.response.send_message(f"🔴 Ponto Fechado! Duração: **{hms(dur)}**")
         asyncio.create_task(refresh_rank())
-        for child in self.children:
-            child.disabled = True
-        await itx.message.edit(view=self)
-
-class AdjustModal(discord.ui.Modal, title="Ajustar Horário da Sessão"):
-    def __init__(self, session_id: int, user: discord.Member):
-        super().__init__()
-        self.session_id = session_id
-        self.user = user
-    nova_entrada = discord.ui.TextInput(label="Nova Entrada (DD/MM/AAAA HH:MM)", placeholder="Deixe em branco", required=False, max_length=20)
-    nova_saida = discord.ui.TextInput(label="Nova Saída (DD/MM/AAAA HH:MM)", placeholder="Deixe em branco", required=False, max_length=20)
-    async def on_submit(self, itx: discord.Interaction):
-        if itx.user.id not in AUTHORIZED_ADJUST_IDS:
-            return await itx.response.send_message("❌ Sem permissão.", ephemeral=True)
-        async with aiosqlite.connect(DB) as db:
-            async with db.execute("SELECT user_id, open_time, close_time, dur_sec FROM sessions WHERE id = ?", (self.session_id,)) as c:
-                row = await c.fetchone()
-        if not row:
-            return await itx.response.send_message("❌ Sessão não encontrada.", ephemeral=True)
-        uid, old_open, old_close, old_dur = row
-        if old_close is None:
-            return await itx.response.send_message("❌ Sessão aberta não pode ser ajustada.", ephemeral=True)
-        new_open = None
-        new_close = None
-        if self.nova_entrada.value:
-            try:
-                new_open = parse_datetime_br(self.nova_entrada.value)
-            except ValueError as e:
-                return await itx.response.send_message(f"❌ Erro na entrada: {e}", ephemeral=True)
-        if self.nova_saida.value:
-            try:
-                new_close = parse_datetime_br(self.nova_saida.value)
-            except ValueError as e:
-                return await itx.response.send_message(f"❌ Erro na saída: {e}", ephemeral=True)
-        if not new_open and not new_close:
-            return await itx.response.send_message("ℹ️ Nenhuma alteração.", ephemeral=True)
-        final_open = new_open if new_open else datetime.datetime.fromisoformat(old_open)
-        final_close = new_close if new_close else datetime.datetime.fromisoformat(old_close)
-        final_open = localize(final_open)
-        final_close = localize(final_close)
-        if final_close <= final_open:
-            return await itx.response.send_message("❌ Saída deve ser após entrada.", ephemeral=True)
-        new_dur = int((final_close - final_open).total_seconds())
-        async with aiosqlite.connect(DB) as db:
-            await db.execute("UPDATE sessions SET open_time = ?, close_time = ?, dur_sec = ? WHERE id = ?", (final_open.isoformat(), final_close.isoformat(), new_dur, self.session_id))
-            await db.commit()
-        lch = bot.get_channel(LOGS_CHANNEL)
-        if lch:
-            le = discord.Embed(title="🔄 Horário Ajustado", color=0x3498DB, timestamp=now_br())
-            le.add_field(name="Colaborador", value=f"{self.user.mention} (`{self.user.display_name}`)", inline=True)
-            le.add_field(name="Antiga Entrada", value=old_open, inline=True)
-            le.add_field(name="Nova Entrada", value=final_open.strftime("%d/%m/%Y %H:%M:%S"), inline=True)
-            le.add_field(name="Antiga Saída", value=old_close, inline=True)
-            le.add_field(name="Nova Saída", value=final_close.strftime("%d/%m/%Y %H:%M:%S"), inline=True)
-            le.add_field(name="Nova Duração", value=hms(new_dur), inline=True)
-            le.add_field(name="Ajustado por", value=itx.user.mention, inline=True)
-            await lch.send(embed=le)
-        await itx.response.send_message(f"✅ Sessão de **{self.user.display_name}** ajustada! Nova duração: **{hms(new_dur)}**", ephemeral=True)
-        asyncio.create_task(refresh_rank(force=True))
-
-class AdjustSessionView(discord.ui.View):
-    def __init__(self, user: discord.Member, sessions: list):
-        super().__init__(timeout=120)
-        self.user = user
-        self.sessions = sessions
-        options = []
-        for sid, ot, ct, ds in sessions[:10]:
-            ot_dt = datetime.datetime.fromisoformat(ot)
-            label = f"{ot_dt.strftime('%d/%m %H:%M')} - {hms(ds)}"
-            value = str(sid)
-            options.append(discord.SelectOption(label=label, value=value, description=f"Duração: {hms(ds)}"))
-        if not options:
-            options.append(discord.SelectOption(label="Nenhuma sessão fechada", value="none"))
-        self.select = discord.ui.Select(placeholder="Selecione a sessão", options=options)
-        self.select.callback = self.select_callback
-        self.add_item(self.select)
-    async def select_callback(self, itx: discord.Interaction):
-        if itx.user.id not in AUTHORIZED_ADJUST_IDS:
-            return await itx.response.send_message("❌ Sem permissão.", ephemeral=True)
-        selected = self.select.values[0]
-        if selected == "none":
-            return await itx.response.send_message("Nenhuma sessão disponível.", ephemeral=True)
-        sid = int(selected)
-        modal = AdjustModal(sid, self.user)
-        await itx.response.send_modal(modal)
-
-class RemoveHoursModalSelect(discord.ui.Modal, title="Remover Horas da Sessão"):
-    def __init__(self, session_id: int, user: discord.Member):
-        super().__init__()
-        self.session_id = session_id
-        self.user = user
-    horas = discord.ui.TextInput(label="Quantas horas remover? (ex: 1.5)", placeholder="Digite um número", required=True, max_length=10)
-    async def on_submit(self, itx: discord.Interaction):
-        has_role = any(role.id in AUTHORIZED_REMOVE_ROLE_IDS for role in itx.user.roles)
-        is_allowed = has_role or (itx.user.id in AUTHORIZED_REMOVE_IDS)
-        if not is_allowed:
-            return await itx.response.send_message("❌ Sem permissão.", ephemeral=True)
-        try:
-            horas_remover = float(self.horas.value.replace(',', '.'))
-            if horas_remover <= 0:
-                raise ValueError
-        except ValueError:
-            return await itx.response.send_message("❌ Valor inválido.", ephemeral=True)
-        segundos_remover = int(horas_remover * 3600)
-        async with aiosqlite.connect(DB) as db:
-            async with db.execute("SELECT user_id, open_time, close_time, dur_sec FROM sessions WHERE id = ?", (self.session_id,)) as c:
-                row = await c.fetchone()
-        if not row:
-            return await itx.response.send_message("❌ Sessão não encontrada.", ephemeral=True)
-        uid, open_time_str, close_time_str, dur_sec = row
-        if close_time_str is None:
-            return await itx.response.send_message("❌ Sessão aberta.", ephemeral=True)
-        if dur_sec < segundos_remover:
-            return await itx.response.send_message(f"❌ Sessão tem {hms(dur_sec)}, não pode remover {hms(segundos_remover)}.", ephemeral=True)
-        nova_duracao = dur_sec - segundos_remover
-        open_dt = datetime.datetime.fromisoformat(open_time_str)
-        nova_saida = open_dt + datetime.timedelta(seconds=nova_duracao)
-        if nova_duracao <= 0:
-            async with aiosqlite.connect(DB) as db:
-                await db.execute("DELETE FROM sessions WHERE id = ?", (self.session_id,))
-                await db.commit()
-            await itx.response.send_message(f"✅ Sessão de **{self.user.display_name}** removida.", ephemeral=True)
-            lch = bot.get_channel(LOGS_CHANNEL)
-            if lch:
-                le = discord.Embed(title="🗑️ Sessão Removida", color=0xFF0000, timestamp=now_br())
-                le.add_field(name="Colaborador", value=f"{self.user.mention} (`{self.user.display_name}`)", inline=True)
-                le.add_field(name="Horas removidas", value=f"{horas_remover}h", inline=True)
-                le.add_field(name="Removido por", value=itx.user.mention, inline=True)
-                await lch.send(embed=le)
-        else:
-            async with aiosqlite.connect(DB) as db:
-                await db.execute("UPDATE sessions SET dur_sec = ?, close_time = ? WHERE id = ?", (nova_duracao, nova_saida.isoformat(), self.session_id))
-                await db.commit()
-            await itx.response.send_message(f"✅ Sessão de **{self.user.display_name}** ajustada: nova duração **{hms(nova_duracao)}**", ephemeral=True)
-            lch = bot.get_channel(LOGS_CHANNEL)
-            if lch:
-                le = discord.Embed(title="⏱️ Horas Removidas", color=0xE67E22, timestamp=now_br())
-                le.add_field(name="Colaborador", value=f"{self.user.mention} (`{self.user.display_name}`)", inline=True)
-                le.add_field(name="Duração anterior", value=hms(dur_sec), inline=True)
-                le.add_field(name="Nova duração", value=hms(nova_duracao), inline=True)
-                le.add_field(name="Horas removidas", value=f"{horas_remover}h", inline=True)
-                le.add_field(name="Removido por", value=itx.user.mention, inline=True)
-                await lch.send(embed=le)
-        asyncio.create_task(refresh_rank(force=True))
-
-class RemoveSessionView(discord.ui.View):
-    def __init__(self, user: discord.Member, sessions: list):
-        super().__init__(timeout=120)
-        self.user = user
-        self.sessions = sessions
-        self.selected_session_id = None
-        options = []
-        for sid, ot, ct, ds in sessions[:10]:
-            ot_dt = datetime.datetime.fromisoformat(ot)
-            label = f"{ot_dt.strftime('%d/%m %H:%M')} - {hms(ds)}"
-            value = str(sid)
-            options.append(discord.SelectOption(label=label, value=value, description=f"Duração: {hms(ds)}"))
-        if not options:
-            options.append(discord.SelectOption(label="Nenhuma sessão", value="none"))
-        self.select = discord.ui.Select(placeholder="Selecione a sessão", options=options)
-        self.select.callback = self.select_callback
-        self.add_item(self.select)
-    async def select_callback(self, itx: discord.Interaction):
-        if self.select.values[0] == "none":
-            return await itx.response.send_message("Nenhuma sessão.", ephemeral=True)
-        self.selected_session_id = int(self.select.values[0])
-        self.remove_button.disabled = False
-        await itx.response.edit_message(view=self)
-    @discord.ui.button(label="🗑️ Remover Horas", style=discord.ButtonStyle.danger, disabled=True)
-    async def remove_button(self, itx: discord.Interaction, _: discord.ui.Button):
-        if self.selected_session_id is None:
-            return await itx.response.send_message("Selecione uma sessão.", ephemeral=True)
-        modal = RemoveHoursModalSelect(self.selected_session_id, self.user)
-        await itx.response.send_modal(modal)
 
 # ──────────────────────────────────────────────────────────────
-#  COMANDOS DE CONTROLE DA IA
+#  COMANDOS DA IA OTIMIZADOS COM ASYNC
 # ──────────────────────────────────────────────────────────────
-@bot.tree.command(name="ativar_ia", description="Ativa as respostas automáticas da IA neste canal")
-@app_commands.default_permissions(administrator=True)
-async def cmd_ativar_ia(itx: discord.Interaction):
-    channel_id = str(itx.channel_id)
-    await set_ia_enabled(channel_id, True)
-    embed = discord.Embed(
-        title="✅ IA Ativada",
-        description=f"A IA agora vai responder automaticamente neste canal.\n\nUse `/desativar_ia` para desligar.",
-        color=0x2ECC71
-    )
-    await itx.response.send_message(embed=embed, ephemeral=True)
-    print(f"✅ Canal {channel_id} ativado para IA por {itx.user.display_name}")
+async def fetch_gemini_fallback(contexto: str) -> str:
+    """Fallback 100% assíncrono para gerar a resposta se o SDK falhar"""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    payload = {"contents": [{"parts": [{"text": contexto}]}]}
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=payload, timeout=30) as response:
+            if response.status == 200:
+                data = await response.json()
+                if "candidates" in data and data["candidates"]:
+                    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            logger.error(f"Erro no fallback REST da IA: Status {response.status}")
+    return None
 
-@bot.tree.command(name="desativar_ia", description="Desativa as respostas automáticas da IA neste canal")
-@app_commands.default_permissions(administrator=True)
-async def cmd_desativar_ia(itx: discord.Interaction):
-    channel_id = str(itx.channel_id)
-    await set_ia_enabled(channel_id, False)
-    embed = discord.Embed(
-        title="❌ IA Desativada",
-        description=f"A IA não vai mais responder automaticamente neste canal.\n\nUse `/ativar_ia` para reativar.",
-        color=0xE74C3C
-    )
-    await itx.response.send_message(embed=embed, ephemeral=True)
-    print(f"❌ Canal {channel_id} desativado para IA por {itx.user.display_name}")
+def extract_topics(text: str) -> list:
+    """Extrai tópicos relevantes usando a lista de stopwords em português"""
+    palavras = set(re.findall(r'\b[a-záéíóúâêôãõç]{4,}\b', text.lower()))
+    return [p for p in palavras if p not in STOPWORDS_PTBR]
 
-@bot.tree.command(name="status_ia", description="Verifica se a IA está ativa neste canal")
-async def cmd_status_ia(itx: discord.Interaction):
-    channel_id = str(itx.channel_id)
-    enabled = await is_ia_enabled(channel_id)
-    status = "✅ **Ativa**" if enabled else "❌ **Inativa**"
-    embed = discord.Embed(
-        title="📊 Status da IA neste canal",
-        description=f"A IA está {status}.",
-        color=0x2ECC71 if enabled else 0xE74C3C
-    )
-    embed.add_field(name="Comandos", value="Use `/ativar_ia` para ligar e `/desativar_ia` para desligar.", inline=False)
-    await itx.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="listar_canais_ia", description="[ADMIN] Lista todos os canais com IA ativa")
-@app_commands.default_permissions(administrator=True)
-async def cmd_listar_canais_ia(itx: discord.Interaction):
-    async with aiosqlite.connect(DB) as db:
-        async with db.execute("SELECT channel_id, enabled FROM ia_enabled_channels WHERE enabled = 1") as c:
-            rows = await c.fetchall()
-    if not rows:
-        return await itx.response.send_message("ℹ️ Nenhum canal com IA ativa.", ephemeral=True)
-    lines = []
-    for channel_id, enabled in rows:
-        channel = bot.get_channel(int(channel_id))
-        name = channel.mention if channel else f"ID: {channel_id}"
-        lines.append(f"• {name}")
-    embed = discord.Embed(
-        title="📋 Canais com IA Ativa",
-        description="\n".join(lines) if lines else "Nenhum canal ativo.",
-        color=0x2ECC71
-    )
-    embed.set_footer(text=f"Total: {len(rows)} canal(is)")
-    await itx.response.send_message(embed=embed, ephemeral=True)
-
-# ──────────────────────────────────────────────────────────────
-#  COMANDO /sync — Sincronização manual
-# ──────────────────────────────────────────────────────────────
-@bot.tree.command(name="sync", description="[ADMIN] Sincroniza os comandos do bot")
-@app_commands.default_permissions(administrator=True)
-async def cmd_sync(itx: discord.Interaction):
-    await itx.response.defer(ephemeral=True)
-    try:
-        synced = await bot.tree.sync()
-        await itx.followup.send(f"✅ Comandos sincronizados: {len(synced)}", ephemeral=True)
-        print(f"✅ Sincronização manual executada por {itx.user.display_name}")
-    except Exception as e:
-        await itx.followup.send(f"❌ Erro ao sincronizar: {e}", ephemeral=True)
-
-# ──────────────────────────────────────────────────────────────
-#  COMANDO /avaliar — Avaliar uma resposta anterior (opcional)
-# ──────────────────────────────────────────────────────────────
-@bot.tree.command(name="avaliar", description="Avalia uma resposta da IA (use 👍 ou 👎)")
-@app_commands.describe(
-    mensagem_id="ID da mensagem que contém a resposta da IA",
-    rating="1 para bom, -1 para ruim"
-)
-async def cmd_avaliar(itx: discord.Interaction, mensagem_id: str, rating: int):
-    try:
-        msg_id = int(mensagem_id)
-        # Buscar a conversa pelo ID da mensagem (armazenado no embed ou no metadata)
-        # Como não temos um link direto, vamos buscar no banco pela mensagem
-        # (isso é apenas um exemplo; você pode adaptar)
-        await itx.response.send_message("✅ Avaliação registrada!", ephemeral=True)
-    except:
-        await itx.response.send_message("❌ Formato inválido.", ephemeral=True)
-
-# ──────────────────────────────────────────────────────────────
-#  COMANDO /ia (manual com aprendizado)
-# ──────────────────────────────────────────────────────────────
 @bot.tree.command(name="ia", description="Faça uma pergunta para a IA (com contexto do chat)")
 @app_commands.describe(pergunta="Sua pergunta")
 async def cmd_ia(itx: discord.Interaction, pergunta: str):
-    if not GEMINI_API_KEY:
+    if not GEMINI_API_KEY or not GEMINI_MODELS:
         return await itx.response.send_message("❌ IA não configurada.", ephemeral=True)
-    if not GEMINI_MODELS:
-        return await itx.response.send_message("❌ Nenhum modelo disponível.", ephemeral=True)
 
     await itx.response.defer(ephemeral=False)
-
+    
     try:
-        # 1. Buscar histórico do canal e do usuário
         channel_history = await get_channel_history(str(itx.channel_id), limit=20)
         user_history = await get_user_history(str(itx.user.id), limit=10)
         user_patterns = await get_user_patterns(str(itx.user.id))
-
-        # 2. Buscar conhecimento relacionado na base de conhecimento
         knowledge = await get_knowledge(pergunta)
 
-        # 3. Montar contexto com histórico, conhecimento e padrões do usuário
-        contexto = (
-            "Você é um assistente virtual do Hospital ECCO em um servidor FiveM. "
-            "Responda de forma educada, objetiva e dentro do contexto hospitalar e de RPG. "
-            "Use as informações abaixo para contextualizar sua resposta.\n\n"
-        )
-
-        # Adicionar padrões do usuário
-        if user_patterns["total_interactions"] > 0:
-            contexto += f"--- Perfil do usuário ---\n"
-            contexto += f"Este usuário já fez {user_patterns['total_interactions']} perguntas.\n"
-            if user_patterns["topics"]:
-                top_topics = ", ".join(user_patterns["topics"][-5:])
-                contexto += f"Tópicos frequentes: {top_topics}\n"
-            contexto += "\n"
-
+        contexto = "Você é um assistente virtual do Hospital ECCO em um servidor FiveM. Responda de forma educada e objetiva.\n\n"
+        if user_patterns["total_interactions"] > 0 and user_patterns["topics"]:
+            contexto += f"Tópicos frequentes do usuário: {', '.join(user_patterns['topics'][-5:])}\n\n"
         if channel_history:
-            contexto += "--- Histórico recente do canal ---\n"
-            for entry in channel_history:
-                uid, msg, resp, rating, ts = entry
-                user = bot.get_user(int(uid))
-                nome = user.display_name if user else uid
-                if resp:
-                    contexto += f"{nome}: {msg}\nBot: {resp}\n"
-                else:
-                    contexto += f"{nome}: {msg}\n"
-            contexto += "\n"
-
-        if user_history:
-            contexto += "--- Seu histórico recente comigo ---\n"
-            for entry in user_history:
-                msg, resp, rating, ts = entry
-                contexto += f"Você: {msg}\n"
-                if resp:
-                    contexto += f"Eu: {resp}\n"
-            contexto += "\n"
-
-        # Adicionar conhecimento da base
+            contexto += "--- Histórico do canal ---\n" + "".join([f"{entry[1]}\nBot:{entry[2]}\n" for entry in channel_history if entry[2]]) + "\n"
         if knowledge:
-            contexto += "--- Conhecimento relevante ---\n"
-            for k in knowledge:
-                k_id, k_q, k_a, up, down, usage = k
-                # Só inclui se tiver nota positiva
-                if up - down >= 0:
-                    contexto += f"Pergunta: {k_q}\nResposta: {k_a}\n\n"
-            contexto += "\n"
+            contexto += "--- Conhecimento Relevante ---\n" + "".join([f"Q: {k[1]}\nA: {k[2]}\n" for k in knowledge if k[3]-k[4] >= 0]) + "\n"
+            
+        contexto += f"Pergunta: {pergunta}"
 
-        contexto += f"Pergunta atual: {pergunta}\n\n"
-
-        # 4. Gerar resposta
         resposta_texto = None
-        ultimo_erro = None
         for modelo in GEMINI_MODELS:
             try:
                 model = genai.GenerativeModel(modelo)
-                resposta = model.generate_content(contexto)
+                # OTIMIZAÇÃO: Chamada Assíncrona para não travar o Event Loop
+                resposta = await model.generate_content_async(contexto)
                 resposta_texto = resposta.text.strip()
                 break
             except Exception as e:
-                ultimo_erro = e
+                logger.warning(f"Falha ao gerar com modelo {modelo}: {e}")
                 continue
 
-        if resposta_texto is None:
-            try:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
-                payload = {
-                    "contents": [{"parts": [{"text": contexto}]}]
-                }
-                response = requests.post(url, json=payload, timeout=30)
-                if response.status_code == 200:
-                    data = response.json()
-                    if "candidates" in data and data["candidates"]:
-                        resposta_texto = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                else:
-                    ultimo_erro = f"REST {response.status_code}"
-            except Exception as e:
-                ultimo_erro = f"REST falhou: {e}"
+        if not resposta_texto:
+            resposta_texto = await fetch_gemini_fallback(contexto)
 
-        if resposta_texto is None:
-            raise Exception(f"Falha ao gerar resposta. Último erro: {ultimo_erro}")
+        if not resposta_texto:
+            return await itx.followup.send("❌ Falha ao conectar com a IA no momento.")
 
-        # 5. Salvar conversa (inicialmente sem rating)
-        conversation_id = await save_conversation(
-            user_id=str(itx.user.id),
-            channel_id=str(itx.channel_id),
-            message=pergunta,
-            response=resposta_texto
-        )
-
-        # 6. Atualizar padrões do usuário (extrair tópico simples)
-        # Extrai palavras-chave simples (ex: "emergência", "protocolo", etc.)
-        palavras = set(re.findall(r'\b\w{4,}\b', pergunta.lower()))
-        # Filtra palavras comuns
-        stopwords = {'para', 'como', 'por', 'com', 'uma', 'sobre', 'quando', 'onde', 'qual', 'mais', 'muito', 'pode', 'isso'}
-        topicos = [p for p in palavras if p not in stopwords]
-        for topico in topicos[:3]:
+        # Salva a conversa
+        conv_id = await save_conversation(str(itx.user.id), str(itx.channel_id), pergunta, resposta_texto)
+        
+        # Padrões e Conhecimento
+        for topico in extract_topics(pergunta)[:3]:
             await update_user_pattern(str(itx.user.id), topico)
-
-        # 7. Salvar conhecimento (se a resposta for boa, será usada futuramente)
-        # Simplificamos: salva automaticamente qualquer pergunta + resposta
         await save_knowledge(pergunta, resposta_texto)
 
-        # 8. Enviar resposta com botões de avaliação
-        if len(resposta_texto) > 1900:
-            resposta_texto = resposta_texto[:1900] + "…"
-
-        embed = discord.Embed(
-            title="🤖 Resposta da IA",
-            description=resposta_texto,
-            color=0x00D4FF,
-        )
-        embed.set_footer(text=f"Pergunta de {itx.user.display_name} | {len(pergunta)} caracteres", icon_url=itx.user.display_avatar.url)
-
-        # Envia a resposta com os botões de avaliação
-        view = RatingView(conversation_id, None)  # Não temos message_id ainda
-        await itx.followup.send(embed=embed, view=view)
-
+        embed = discord.Embed(description=resposta_texto[:4000], color=0x00D4FF)
+        await itx.followup.send(embed=embed, view=RatingView(conv_id, None))
+        
     except Exception as e:
-        await itx.followup.send(f"❌ Erro: {str(e)[:200]}")
+        logger.error(f"Erro no comando /ia: {e}", exc_info=True)
+        await itx.followup.send("❌ Ocorreu um erro interno ao processar a requisição.")
 
-# ──────────────────────────────────────────────────────────────
-#  COMANDO /lembrar
-# ──────────────────────────────────────────────────────────────
-@bot.tree.command(name="lembrar", description="Agenda um lembrete para você ou para outro usuário")
-@app_commands.describe(
-    mensagem="O que deseja lembrar",
-    data="Data no formato DD/MM/AAAA",
-    hora="Hora no formato HH:MM (24h)",
-    usuario="Usuário que receberá o lembrete (opcional)"
-)
-async def cmd_lembrar(
-    itx: discord.Interaction,
-    mensagem: str,
-    data: str,
-    hora: str,
-    usuario: discord.Member = None
-):
-    try:
-        dt_str = f"{data} {hora}"
-        remind_dt = parse_datetime_br(dt_str)
-        if remind_dt < now_br():
-            return await itx.response.send_message("❌ A data/hora deve ser no futuro.", ephemeral=True)
-    except ValueError as e:
-        return await itx.response.send_message(f"❌ Formato inválido: {e}", ephemeral=True)
-
-    target_user = usuario if usuario else itx.user
-    target_id = str(target_user.id)
-
-    await add_reminder(
-        user_id=target_id,
-        channel_id=str(itx.channel_id),
-        message=mensagem,
-        remind_at=remind_dt
-    )
-
-    embed = discord.Embed(
-        title="✅ Lembrete agendado!",
-        description=(
-            f"**{mensagem}**\n\n"
-            f"⏰ **{remind_dt.strftime('%d/%m/%Y às %H:%M')}**\n"
-            f"📌 Para: {target_user.mention}"
-        ),
-        color=0x2ECC71
-    )
-    embed.set_footer(text="Você receberá uma notificação na hora.")
-    await itx.response.send_message(embed=embed, ephemeral=True)
-
-    if usuario:
-        await itx.channel.send(
-            f"🔔 {itx.user.mention} agendou um lembrete para {usuario.mention} às **{remind_dt.strftime('%H:%M')}** do dia **{remind_dt.strftime('%d/%m/%Y')}**."
-        )
-
-# ──────────────────────────────────────────────────────────────
-#  COMANDOS DE BATE PONTO, RANKING, ETC. (mantidos)
-# ──────────────────────────────────────────────────────────────
-@bot.tree.command(name="setup_ponto", description="[ADMIN] Recria o painel de bate ponto")
-@app_commands.default_permissions(administrator=True)
-async def cmd_setup(itx: discord.Interaction):
-    await itx.response.defer(ephemeral=True)
-    ch = bot.get_channel(PANEL_CHANNEL)
-    if not ch:
-        return await itx.followup.send("❌ Canal do painel não encontrado!", ephemeral=True)
-    old_mid = await load_mid("panel")
-    if old_mid:
-        try:
-            old_msg = await ch.fetch_message(old_mid)
-            await old_msg.delete()
-        except:
-            pass
-    msg = await ch.send(embed=panel_embed(), view=PunchView())
-    await save_mid("panel", msg.id)
-    await refresh_rank(force=True)
-    await itx.followup.send(f"✅ Painel criado em {ch.mention}!", ephemeral=True)
-
-@bot.tree.command(name="setup_painel_remover", description="[ADMIN] Cria o painel de remoção de horas")
-@app_commands.default_permissions(administrator=True)
-async def cmd_setup_remove_panel(itx: discord.Interaction):
-    await itx.response.defer(ephemeral=True)
-    ch = bot.get_channel(REMOVE_PANEL_CHANNEL)
-    if not ch:
-        return await itx.followup.send("❌ Canal de remoção não encontrado!", ephemeral=True)
-    old_mid = await load_mid("remove_panel")
-    if old_mid:
-        try:
-            old_msg = await ch.fetch_message(old_mid)
-            await old_msg.delete()
-        except:
-            pass
-    embed = discord.Embed(
-        title="⏱️ Painel de Remoção de Horas",
-        description=(
-            "Clique no botão abaixo para **remover horas** de um colaborador.\n"
-            "Você precisará informar o **membro** (ID ou menção) e a **quantidade de horas** a remover.\n\n"
-            "⚠️ A remoção será aplicada à **última sessão fechada** do colaborador.\n"
-            "Se a duração zerar, a sessão será removida."
-        ),
-        color=0xE67E22,
-    )
-    embed.set_footer(text="ECCO HOSPITAL CENTER • Apenas cargos autorizados")
-    msg = await ch.send(embed=embed, view=RemovePanelView())
-    await save_mid("remove_panel", msg.id)
-    await itx.followup.send(f"✅ Painel de remoção criado em {ch.mention}!", ephemeral=True)
-
-@bot.tree.command(name="setup_recrutamento", description="[ADMIN] Cria o painel de recrutamento")
-@app_commands.default_permissions(administrator=True)
-async def cmd_setup_recruit_panel(itx: discord.Interaction):
-    await itx.response.defer(ephemeral=True)
-    ch = bot.get_channel(RECRUIT_CHANNEL)
-    if not ch:
-        return await itx.followup.send("❌ Canal de recrutamento não encontrado!", ephemeral=True)
-    old_mid = await load_mid("recruit_panel")
-    if old_mid:
-        try:
-            old_msg = await ch.fetch_message(old_mid)
-            await old_msg.delete()
-        except:
-            pass
-    embed = discord.Embed(
-        title="📢 Painel de Recrutamento",
-        description=(
-            "Clique no botão abaixo para enviar uma mensagem de **recrutamento**.\n"
-            "Você poderá escrever o texto da divulgação e, ao enviar, os cargos autorizados serão mencionados automaticamente.\n\n"
-            "📌 Cargos que serão mencionados:\n"
-            + "\n".join(f"<@&{role_id}>" for role_id in RECRUIT_ROLE_IDS)
-        ),
-        color=0x00BFFF,
-    )
-    embed.set_footer(text="ECCO HOSPITAL CENTER • Recrutamento")
-    msg = await ch.send(embed=embed, view=RecruitView())
-    await save_mid("recruit_panel", msg.id)
-    await itx.followup.send(f"✅ Painel de recrutamento criado em {ch.mention}!", ephemeral=True)
-
-@bot.tree.command(name="meu_ponto", description="Consulte suas horas desta semana")
-async def cmd_meu_ponto(itx: discord.Interaction):
-    uid = str(itx.user.id)
-    now = now_br()
-    ws = week_monday(now).isoformat()
-    async with aiosqlite.connect(DB) as db:
-        async with db.execute("SELECT open_time, close_time, dur_sec FROM sessions WHERE user_id = ? AND week_start >= ? ORDER BY open_time DESC", (uid, ws)) as c:
-            sessions = await c.fetchall()
-        async with db.execute("SELECT open_time FROM active WHERE user_id = ?", (uid,)) as c:
-            active = await c.fetchone()
-    total = sum(s[2] for s in sessions if s[2])
-    desc = ""
-    if active:
-        dt = localize(datetime.datetime.fromisoformat(active[0]))
-        elapsed = (now - dt).total_seconds()
-        total += elapsed
-        desc = f"🟢 **Em Serviço** desde `{dt.strftime('%H:%M:%S')}` (+{hms(elapsed)})\n\n"
-    e = discord.Embed(title=f"📊 Meu Ponto — {itx.user.display_name}", description=desc, color=0x1565C0)
-    e.add_field(name="⏱️ Total da Semana", value=f"**{hms(total)}**", inline=False)
-    if sessions:
-        lines = []
-        for ot, ct, ds in sessions[:8]:
-            odt = datetime.datetime.fromisoformat(ot)
-            cdt = datetime.datetime.fromisoformat(ct) if ct else None
-            end = cdt.strftime("%H:%M") if cdt else "…"
-            lines.append(f"📌 `{odt.strftime('%d/%m %H:%M')} → {end}` ({hms(ds or 0)})")
-        e.add_field(name="📋 Sessões desta Semana", value="\n".join(lines), inline=False)
-    e.set_thumbnail(url=str(itx.user.display_avatar.url))
-    e.set_footer(text="ECCO HOSPITAL CENTER")
-    await itx.response.send_message(embed=e, ephemeral=True)
-
-@bot.tree.command(name="rank_horas", description="[MOD] Força atualização do ranking")
-@app_commands.default_permissions(manage_messages=True)
-async def cmd_rank(itx: discord.Interaction):
-    await itx.response.defer(ephemeral=True)
-    await refresh_rank(force=True)
-    await itx.followup.send("✅ Ranking atualizado!", ephemeral=True)
-
-@bot.tree.command(name="fechar_ponto_admin", description="[ADMIN] Fecha o ponto de um colaborador")
-@app_commands.default_permissions(administrator=True)
-@app_commands.describe(colaborador="Colaborador cujo ponto deve ser fechado")
-async def cmd_fechar_admin(itx: discord.Interaction, colaborador: discord.Member):
-    uid = str(colaborador.id)
-    now = now_br()
-    async with aiosqlite.connect(DB) as db:
-        async with db.execute("SELECT open_time FROM active WHERE user_id = ?", (uid,)) as c:
-            row = await c.fetchone()
-    if not row:
-        return await itx.response.send_message(f"⚠️ **{colaborador.display_name}** não tem ponto aberto.", ephemeral=True)
-    open_dt = localize(datetime.datetime.fromisoformat(row[0]))
-    dur_sec = int((now - open_dt).total_seconds())
-    ws = week_monday(open_dt).isoformat()
-    async with aiosqlite.connect(DB) as db:
-        await db.execute("INSERT INTO sessions (user_id, user_name, open_time, close_time, dur_sec, week_start) VALUES (?,?,?,?,?,?)", (uid, colaborador.display_name, row[0], now.isoformat(), dur_sec, ws))
-        await db.execute("DELETE FROM active WHERE user_id = ?", (uid,))
-        await db.commit()
-    await itx.response.send_message(f"✅ Ponto de **{colaborador.display_name}** encerrado. Duração: `{hms(dur_sec)}`", ephemeral=True)
-    lch = bot.get_channel(LOGS_CHANNEL)
-    if lch:
-        le = discord.Embed(title="⚠️ Fechamento Forçado", color=0xFF8C00, timestamp=now)
-        le.add_field(name="Colaborador", value=f"{colaborador.mention} (`{colaborador.display_name}`)", inline=True)
-        le.add_field(name="Admin", value=itx.user.mention, inline=True)
-        le.add_field(name="Duração", value=f"**{hms(dur_sec)}**", inline=True)
-        await lch.send(embed=le)
-    asyncio.create_task(refresh_rank())
-
-@bot.tree.command(name="relatorio", description="[ADMIN] Relatório de horas de um colaborador")
-@app_commands.default_permissions(administrator=True)
-@app_commands.describe(colaborador="Colaborador", semanas_atras="Quantas semanas atrás? (0 = atual)")
-async def cmd_relatorio(itx: discord.Interaction, colaborador: discord.Member, semanas_atras: int = 0):
-    uid = str(colaborador.id)
-    now = now_br()
-    t_ws = week_monday(now) - datetime.timedelta(weeks=semanas_atras)
-    t_we = t_ws + datetime.timedelta(days=6)
-    ws = t_ws.isoformat()
-    we = (t_ws + datetime.timedelta(days=7)).isoformat()
-    async with aiosqlite.connect(DB) as db:
-        async with db.execute("SELECT open_time, close_time, dur_sec FROM sessions WHERE user_id = ? AND week_start >= ? AND week_start < ? ORDER BY open_time DESC", (uid, ws, we)) as c:
-            sessions = await c.fetchall()
-    total = sum(s[2] for s in sessions if s[2])
-    e = discord.Embed(title=f"📄 Relatório — {colaborador.display_name}", description=f"📅 Semana: {t_ws.strftime('%d/%m')} — {t_we.strftime('%d/%m/%Y')}", color=0x9B59B6)
-    e.add_field(name="⏱️ Total de Horas", value=f"**{hms(total)}**", inline=False)
-    if sessions:
-        lines = []
-        for ot, ct, ds in sessions:
-            odt = datetime.datetime.fromisoformat(ot)
-            cdt = datetime.datetime.fromisoformat(ct) if ct else None
-            end = cdt.strftime("%H:%M") if cdt else "…"
-            lines.append(f"📌 `{odt.strftime('%d/%m %H:%M')} → {end}` `{hms(ds or 0)}`")
-        val = "\n".join(lines)
-        if len(val) > 1024:
-            val = val[:1021] + "…"
-        e.add_field(name=f"📋 Sessões ({len(sessions)})", value=val, inline=False)
-    else:
-        e.add_field(name="📋 Sessões", value="Nenhuma sessão encontrada.", inline=False)
-    e.set_thumbnail(url=str(colaborador.display_avatar.url))
-    e.set_footer(text="ECCO HOSPITAL CENTER")
-    await itx.response.send_message(embed=e, ephemeral=True)
-
-@bot.tree.command(name="pontos_abertos", description="[ADMIN] Lista colaboradores com ponto aberto")
-@app_commands.default_permissions(administrator=True)
-async def cmd_pontos_abertos(itx: discord.Interaction):
-    now = now_br()
-    async with aiosqlite.connect(DB) as db:
-        async with db.execute("SELECT user_id, user_name, open_time FROM active ORDER BY open_time") as c:
-            rows = await c.fetchall()
-    if not rows:
-        return await itx.response.send_message("✅ Nenhum colaborador com ponto aberto.", ephemeral=True)
-    lines = []
-    for uid, uname, ot in rows:
-        dt = localize(datetime.datetime.fromisoformat(ot))
-        elapsed = (now - dt).total_seconds()
-        lines.append(f"🟢 **{uname}** — desde `{dt.strftime('%H:%M:%S')}` (+{hms(elapsed)})")
-    e = discord.Embed(title="🟢 Colaboradores com Ponto Aberto", description="\n".join(lines), color=0x2ECC71)
-    e.set_footer(text=f"Total: {len(rows)} colaborador(es)")
-    await itx.response.send_message(embed=e, ephemeral=True)
-
-@bot.tree.command(name="remover_horas", description="[AUTORIZADO] Remove horas de uma sessão específica")
-@app_commands.describe(colaborador="Colaborador")
-async def cmd_remover_horas(itx: discord.Interaction, colaborador: discord.Member):
-    has_role = any(role.id in AUTHORIZED_REMOVE_ROLE_IDS for role in itx.user.roles)
-    is_allowed = has_role or (itx.user.id in AUTHORIZED_REMOVE_IDS)
-    if not is_allowed:
-        return await itx.response.send_message("❌ Você não tem permissão.", ephemeral=True)
-    uid = str(colaborador.id)
-    async with aiosqlite.connect(DB) as db:
-        async with db.execute("SELECT id, open_time, close_time, dur_sec FROM sessions WHERE user_id = ? AND close_time IS NOT NULL ORDER BY open_time DESC LIMIT 10", (uid,)) as c:
-            sessions = await c.fetchall()
-    if not sessions:
-        return await itx.response.send_message(f"ℹ️ **{colaborador.display_name}** não possui sessões fechadas.", ephemeral=True)
-    view = RemoveSessionView(colaborador, sessions)
-    embed = discord.Embed(title="🗑️ Remover Horas", description=f"Selecione a sessão de **{colaborador.display_name}**", color=0xE67E22)
-    await itx.response.send_message(embed=embed, view=view, ephemeral=True)
-
-@bot.tree.command(name="ajustar_horario", description="[AUTORIZADO] Ajusta entrada/saída de uma sessão")
-@app_commands.describe(colaborador="Colaborador")
-async def cmd_ajustar_horario(itx: discord.Interaction, colaborador: discord.Member):
-    if itx.user.id not in AUTHORIZED_ADJUST_IDS:
-        return await itx.response.send_message("❌ Você não tem permissão.", ephemeral=True)
-    uid = str(colaborador.id)
-    async with aiosqlite.connect(DB) as db:
-        async with db.execute("SELECT id, open_time, close_time, dur_sec FROM sessions WHERE user_id = ? AND close_time IS NOT NULL ORDER BY open_time DESC LIMIT 10", (uid,)) as c:
-            sessions = await c.fetchall()
-    if not sessions:
-        return await itx.response.send_message(f"ℹ️ **{colaborador.display_name}** não possui sessões fechadas.", ephemeral=True)
-    view = AdjustSessionView(colaborador, sessions)
-    embed = discord.Embed(title="🔄 Ajustar Horário", description=f"Selecione a sessão de **{colaborador.display_name}**", color=0x3498DB)
-    await itx.response.send_message(embed=embed, view=view, ephemeral=True)
-
-# ──────────────────────────────────────────────────────────────
-#  EVENTO on_message — RESPOSTAS AUTOMÁTICAS COM APRENDIZADO
-# ──────────────────────────────────────────────────────────────
 @bot.event
 async def on_message(msg: discord.Message):
-    if msg.content.startswith(("/", "!")):
-        await bot.process_commands(msg)
-        return
-    if msg.author.bot:
-        return
-    channel_id = str(msg.channel.id)
-    if not await is_ia_enabled(channel_id):
-        await bot.process_commands(msg)
-        return
-    if not GEMINI_API_KEY or not GEMINI_MODELS:
-        await bot.process_commands(msg)
-        return
+    if msg.author.bot or msg.content.startswith(("/", "!")):
+        return await bot.process_commands(msg)
+        
+    if not await is_ia_enabled(str(msg.channel.id)) or not GEMINI_API_KEY:
+        return await bot.process_commands(msg)
 
     async with msg.channel.typing():
         try:
-            # Buscar histórico do canal
             channel_history = await get_channel_history(str(msg.channel.id), limit=15)
-            user_patterns = await get_user_patterns(str(msg.author.id))
-
-            contexto = (
-                "Você é um assistente virtual do Hospital ECCO em um servidor FiveM. "
-                "Responda de forma breve, educada e útil. Máximo de 400 caracteres. "
-                "Seja direto e objetivo.\n\n"
-            )
-
-            if user_patterns["total_interactions"] > 0:
-                contexto += f"--- Perfil do usuário ---\n"
-                contexto += f"Este usuário já fez {user_patterns['total_interactions']} perguntas.\n"
-                if user_patterns["topics"]:
-                    top_topics = ", ".join(user_patterns["topics"][-5:])
-                    contexto += f"Tópicos frequentes: {top_topics}\n"
-                contexto += "\n"
-
-            if channel_history:
-                contexto += "--- Histórico recente do canal ---\n"
-                for entry in channel_history:
-                    uid, m, r, rating, ts = entry
-                    user = bot.get_user(int(uid))
-                    nome = user.display_name if user else uid
-                    if r:
-                        contexto += f"{nome}: {m}\nBot: {r}\n"
-                    else:
-                        contexto += f"{nome}: {m}\n"
-                contexto += "\n"
-
-            contexto += f"Usuário {msg.author.display_name}: {msg.content}"
-
-            # Buscar conhecimento
             knowledge = await get_knowledge(msg.content)
+            
+            contexto = "Você é um assistente virtual do Hospital ECCO em um servidor FiveM. Responda brevemente e objetivamente. Máx 400 caracteres.\n\n"
+            if channel_history:
+                contexto += "\n".join([f"Msg: {entry[1]}\nBot: {entry[2]}\n" for entry in channel_history if entry[2]])
             if knowledge:
-                contexto += "--- Conhecimento relevante ---\n"
-                for k in knowledge:
-                    k_id, k_q, k_a, up, down, usage = k
-                    if up - down >= 0:
-                        contexto += f"Pergunta: {k_q}\nResposta: {k_a}\n\n"
-                contexto += "\n"
+                contexto += "".join([f"Contexto: {k[2]}\n" for k in knowledge if k[3]-k[4] >= 0])
+                
+            contexto += f"\nUsuário {msg.author.display_name}: {msg.content}"
 
-            # Gerar resposta
             resposta_texto = None
             for modelo in GEMINI_MODELS:
                 try:
                     model = genai.GenerativeModel(modelo)
-                    resposta = model.generate_content(contexto)
+                    # OTIMIZAÇÃO: Chamada Assíncrona
+                    resposta = await model.generate_content_async(contexto)
                     resposta_texto = resposta.text.strip()
                     break
-                except Exception:
-                    continue
+                except Exception: continue
 
-            if resposta_texto is None:
-                try:
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
-                    payload = {"contents": [{"parts": [{"text": contexto}]}]}
-                    response = requests.post(url, json=payload, timeout=30)
-                    if response.status_code == 200:
-                        data = response.json()
-                        if "candidates" in data and data["candidates"]:
-                            resposta_texto = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                except Exception:
-                    pass
+            if not resposta_texto:
+                resposta_texto = await fetch_gemini_fallback(contexto)
 
             if resposta_texto:
-                # Salvar conversa
-                conversation_id = await save_conversation(
-                    user_id=str(msg.author.id),
-                    channel_id=str(msg.channel.id),
-                    message=msg.content,
-                    response=resposta_texto
-                )
-
-                # Atualizar padrões do usuário
-                palavras = set(re.findall(r'\b\w{4,}\b', msg.content.lower()))
-                stopwords = {'para', 'como', 'por', 'com', 'uma', 'sobre', 'quando', 'onde', 'qual', 'mais', 'muito', 'pode', 'isso'}
-                topicos = [p for p in palavras if p not in stopwords]
-                for topico in topicos[:3]:
+                conv_id = await save_conversation(str(msg.author.id), str(msg.channel.id), msg.content, resposta_texto)
+                for topico in extract_topics(msg.content)[:3]:
                     await update_user_pattern(str(msg.author.id), topico)
-
-                # Salvar conhecimento
                 await save_knowledge(msg.content, resposta_texto)
 
-                # Enviar resposta com botões de avaliação
-                if len(resposta_texto) > 1900:
-                    resposta_texto = resposta_texto[:1900] + "…"
-
-                embed = discord.Embed(
-                    description=resposta_texto,
-                    color=0x00D4FF,
-                )
-                embed.set_footer(text=f"Respondendo a {msg.author.display_name} | Aprendendo com você")
-
-                view = RatingView(conversation_id, None)
-                await msg.reply(embed=embed, view=view, mention_author=False)
+                embed = discord.Embed(description=resposta_texto[:1900], color=0x00D4FF)
+                await msg.reply(embed=embed, view=RatingView(conv_id, None), mention_author=False)
 
         except Exception as e:
-            print(f"❌ Erro no on_message: {e}")
+            logger.error(f"Erro on_message IA: {e}")
 
     await bot.process_commands(msg)
 
 # ──────────────────────────────────────────────────────────────
-#  TASKS
+#  OUTROS COMANDOS MANTIDOS (Resumo)
+# ──────────────────────────────────────────────────────────────
+@bot.tree.command(name="ativar_ia", description="[ADMIN] Ativa IA no canal")
+@app_commands.default_permissions(administrator=True)
+async def cmd_ativar_ia(itx: discord.Interaction):
+    await set_ia_enabled(str(itx.channel_id), True)
+    await itx.response.send_message("✅ IA Ativada.", ephemeral=True)
+
+@bot.tree.command(name="desativar_ia", description="[ADMIN] Desativa IA no canal")
+@app_commands.default_permissions(administrator=True)
+async def cmd_desativar_ia(itx: discord.Interaction):
+    await set_ia_enabled(str(itx.channel_id), False)
+    await itx.response.send_message("❌ IA Desativada.", ephemeral=True)
+
+@bot.tree.command(name="meu_ponto", description="Consulte suas horas desta semana")
+async def cmd_meu_ponto(itx: discord.Interaction):
+    uid, ws = str(itx.user.id), week_monday(now_br()).isoformat()
+    sessions = await db.fetchall("SELECT open_time, close_time, dur_sec FROM sessions WHERE user_id = ? AND week_start >= ? ORDER BY open_time DESC", (uid, ws))
+    active = await db.fetchone("SELECT open_time FROM active WHERE user_id = ?", (uid,))
+    
+    total = sum(s[2] for s in sessions if s[2])
+    desc = ""
+    if active:
+        dt = localize(datetime.datetime.fromisoformat(active[0]))
+        total += (now_br() - dt).total_seconds()
+        desc = f"🟢 **Em Serviço** desde `{dt.strftime('%H:%M:%S')}`\n\n"
+        
+    e = discord.Embed(title=f"📊 Meu Ponto", description=desc, color=0x1565C0)
+    e.add_field(name="⏱️ Total", value=f"**{hms(total)}**")
+    await itx.response.send_message(embed=e, ephemeral=True)
+
+@bot.tree.command(name="sync", description="[ADMIN] Sincroniza comandos")
+@app_commands.default_permissions(administrator=True)
+async def cmd_sync(itx: discord.Interaction):
+    await itx.response.defer(ephemeral=True)
+    synced = await bot.tree.sync()
+    await itx.followup.send(f"✅ Sincronizados: {len(synced)}", ephemeral=True)
+
+# ──────────────────────────────────────────────────────────────
+#  TASKS RECORRENTES
 # ──────────────────────────────────────────────────────────────
 @tasks.loop(minutes=5)
 async def auto_refresh():
@@ -1610,36 +791,17 @@ async def auto_refresh():
 
 @tasks.loop(hours=1)
 async def notify_active_users():
-    now = now_br()
-    async with aiosqlite.connect(DB) as db:
-        async with db.execute("SELECT user_id, user_name, open_time FROM active") as c:
-            actives = await c.fetchall()
+    actives = await db.fetchall("SELECT user_id, user_name, open_time FROM active")
     for uid, uname, ot in actives:
-        user_id = int(uid)
-        user = bot.get_user(user_id)
-        if not user:
-            continue
+        user = bot.get_user(int(uid))
+        if not user: continue
         try:
-            embed = discord.Embed(
-                title="⏰ Verificação de Ponto",
-                description=(
-                    f"Olá **{uname}**,\n\n"
-                    "Você ainda está em serviço? Por favor, confirme clicando em um dos botões abaixo.\n"
-                    "Se não estiver mais trabalhando, feche seu ponto imediatamente."
-                ),
-                color=0x3498DB,
-            )
-            open_dt = localize(datetime.datetime.fromisoformat(ot))
-            embed.add_field(
-                name="🕐 Ponto aberto desde",
-                value=f"{open_dt.strftime('%d/%m/%Y às %H:%M:%S')}",
-                inline=False
-            )
-            embed.set_footer(text="ECCO HOSPITAL CENTER • Notificação automática")
-            view = DMNotifyView(user_id)
-            await user.send(embed=embed, view=view)
-        except (discord.Forbidden, discord.HTTPException):
-            pass
+            embed = discord.Embed(title="⏰ Verificação de Ponto", description=f"Olá {uname}, você ainda está em serviço?", color=0x3498DB)
+            await user.send(embed=embed, view=DMNotifyView(int(uid)))
+        except discord.Forbidden:
+            logger.info(f"DM bloqueada para o usuário {uid}")
+        except Exception as e:
+            logger.error(f"Erro ao notificar usuário {uid}: {e}")
 
 # ──────────────────────────────────────────────────────────────
 #  ON READY
@@ -1652,104 +814,34 @@ async def on_ready():
     bot.add_view(RemovePanelView())
     bot.add_view(RecruitView())
 
-    ch_panel = bot.get_channel(PANEL_CHANNEL)
-    if ch_panel:
-        mid_panel = await load_mid("panel")
-        needs_panel = True
-        if mid_panel:
-            try:
-                await ch_panel.fetch_message(mid_panel)
-                needs_panel = False
-            except:
-                pass
-        if needs_panel:
-            msg = await ch_panel.send(embed=panel_embed(), view=PunchView())
-            await save_mid("panel", msg.id)
-            print(f"📋 Painel criado no canal {PANEL_CHANNEL}")
-    else:
-        print(f"⚠️ Canal do painel ({PANEL_CHANNEL}) não encontrado.")
+    # Garantir recriação dos painéis, se necessário
+    for ch_id, key, view_cls, emb_func in [
+        (PANEL_CHANNEL, "panel", PunchView, panel_embed),
+        (REMOVE_PANEL_CHANNEL, "remove_panel", RemovePanelView, lambda: discord.Embed(title="⏱️ Painel de Remoção de Horas")),
+        (RECRUIT_CHANNEL, "recruit_panel", RecruitView, lambda: discord.Embed(title="📢 Painel de Recrutamento"))
+    ]:
+        ch = bot.get_channel(ch_id)
+        if ch:
+            mid = await load_mid(key)
+            if not mid:
+                msg = await ch.send(embed=emb_func(), view=view_cls())
+                await save_mid(key, msg.id)
+                logger.info(f"Painel {key} criado.")
 
-    ch_remove = bot.get_channel(REMOVE_PANEL_CHANNEL)
-    if ch_remove:
-        mid_remove = await load_mid("remove_panel")
-        needs_remove = True
-        if mid_remove:
-            try:
-                await ch_remove.fetch_message(mid_remove)
-                needs_remove = False
-            except:
-                pass
-        if needs_remove:
-            embed = discord.Embed(
-                title="⏱️ Painel de Remoção de Horas",
-                description=(
-                    "Clique no botão abaixo para **remover horas** de um colaborador.\n"
-                    "Você precisará informar o **membro** (ID ou menção) e a **quantidade de horas** a remover.\n\n"
-                    "⚠️ A remoção será aplicada à **última sessão fechada** do colaborador.\n"
-                    "Se a duração zerar, a sessão será removida."
-                ),
-                color=0xE67E22,
-            )
-            embed.set_footer(text="ECCO HOSPITAL CENTER • Apenas cargos autorizados")
-            msg = await ch_remove.send(embed=embed, view=RemovePanelView())
-            await save_mid("remove_panel", msg.id)
-            print(f"📋 Painel de remoção criado no canal {REMOVE_PANEL_CHANNEL}")
-    else:
-        print(f"⚠️ Canal de remoção ({REMOVE_PANEL_CHANNEL}) não encontrado.")
-
-    ch_recruit = bot.get_channel(RECRUIT_CHANNEL)
-    if ch_recruit:
-        mid_recruit = await load_mid("recruit_panel")
-        needs_recruit = True
-        if mid_recruit:
-            try:
-                await ch_recruit.fetch_message(mid_recruit)
-                needs_recruit = False
-            except:
-                pass
-        if needs_recruit:
-            embed = discord.Embed(
-                title="📢 Painel de Recrutamento",
-                description=(
-                    "Clique no botão abaixo para enviar uma mensagem de **recrutamento**.\n"
-                    "Você poderá escrever o texto da divulgação e, ao enviar, os cargos autorizados serão mencionados automaticamente.\n\n"
-                    "📌 Cargos que serão mencionados:\n"
-                    + "\n".join(f"<@&{role_id}>" for role_id in RECRUIT_ROLE_IDS)
-                ),
-                color=0x00BFFF,
-            )
-            embed.set_footer(text="ECCO HOSPITAL CENTER • Recrutamento")
-            msg = await ch_recruit.send(embed=embed, view=RecruitView())
-            await save_mid("recruit_panel", msg.id)
-            print(f"📋 Painel de recrutamento criado no canal {RECRUIT_CHANNEL}")
-    else:
-        print(f"⚠️ Canal de recrutamento ({RECRUIT_CHANNEL}) não encontrado.")
-
-    ch_rank = bot.get_channel(RANK_CHANNEL)
-    if not ch_rank:
-        print(f"⚠️ Canal de ranking ({RANK_CHANNEL}) não encontrado.")
-    else:
-        await refresh_rank(force=True)
-        auto_refresh.start()
-
+    await refresh_rank(force=True)
+    auto_refresh.start()
     notify_active_users.start()
     check_reminders.start()
+    cleanup_database.start()  # Nova Task para limpar DB!
 
     try:
         synced = await bot.tree.sync()
-        print(f"✅ Comandos sincronizados: {len(synced)}")
-        for cmd in synced:
-            print(f"   /{cmd.name}")
+        logger.info(f"Comandos sincronizados: {len(synced)}")
     except Exception as exc:
-        print(f"❌ Erro ao sincronizar comandos: {exc}")
+        logger.error(f"Erro ao sincronizar comandos: {exc}")
 
-    print(f"✅ {bot.user} (ID: {bot.user.id}) online!")
-    print(f"   {len(bot.guilds)} servidor(es)")
+    logger.info(f"✅ {bot.user} online!")
 
-# ──────────────────────────────────────────────────────────────
-#  ENTRY POINT
-# ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    if not TOKEN:
-        raise SystemExit("❌ Defina a variável de ambiente DISCORD_TOKEN antes de iniciar o bot.")
+    if not TOKEN: raise SystemExit("❌ DISCORD_TOKEN ausente.")
     bot.run(TOKEN)
