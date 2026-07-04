@@ -1,7 +1,8 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║          ECCO HOSPITAL CENTER — BOT DE BATE PONTO           ║
-║         COM IA, MEMÓRIA, LEMBRETES E RESPOSTAS AUTOMÁTICAS  ║
+║            COM IA, MEMÓRIA E RESPOSTAS AUTOMÁTICAS          ║
+║                 CONTROLE POR CANAL (/ativar)                ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -54,9 +55,6 @@ if GEMINI_API_KEY:
 else:
     print("⚠️ Chave API Gemini não encontrada.")
 
-# Canal onde o bot responderá automaticamente (defina o ID ou None)
-IA_CHANNEL_ID = None  # Exemplo: 123456789012345678
-
 # ──────────────────────────────────────────────────────────────
 #  CONFIGURAÇÃO DO BOT
 # ──────────────────────────────────────────────────────────────
@@ -103,7 +101,7 @@ _rank_lock   = asyncio.Lock()
 _last_update: float = 0.0
 
 # ──────────────────────────────────────────────────────────────
-#  DATABASE
+#  DATABASE (com tabelas para IA e controle de canais)
 # ──────────────────────────────────────────────────────────────
 async def init_db():
     db_dir = os.path.dirname(os.path.abspath(DB))
@@ -145,10 +143,14 @@ async def init_db():
                 remind_at  TEXT NOT NULL,
                 done       INTEGER DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS ia_enabled_channels (
+                channel_id TEXT PRIMARY KEY,
+                enabled    INTEGER DEFAULT 1
+            );
         """)
         await db.commit()
 
-        # Migração: verificar se a coluna 'done' existe na tabela reminders
+        # Migrações
         cursor = await db.execute("PRAGMA table_info(reminders)")
         columns = await cursor.fetchall()
         col_names = [col[1] for col in columns]
@@ -157,7 +159,6 @@ async def init_db():
             await db.commit()
             print("✅ Coluna 'done' adicionada à tabela reminders.")
 
-        # Migração: verificar se a coluna 'response' existe na tabela conversation_history
         cursor = await db.execute("PRAGMA table_info(conversation_history)")
         columns = await cursor.fetchall()
         col_names = [col[1] for col in columns]
@@ -167,7 +168,7 @@ async def init_db():
             print("✅ Coluna 'response' adicionada à tabela conversation_history.")
 
 # ──────────────────────────────────────────────────────────────
-#  FUNÇÕES AUXILIARES PARA HISTÓRICO E LEMBRETES
+#  FUNÇÕES AUXILIARES PARA IA E LEMBRETES
 # ──────────────────────────────────────────────────────────────
 async def save_conversation(user_id: str, channel_id: str, message: str, response: str = None):
     async with aiosqlite.connect(DB) as db:
@@ -218,8 +219,25 @@ async def mark_reminder_done(reminder_id: int):
         await db.execute("UPDATE reminders SET done = 1 WHERE id = ?", (reminder_id,))
         await db.commit()
 
+async def is_ia_enabled(channel_id: str) -> bool:
+    """Verifica se a IA está ativada no canal."""
+    async with aiosqlite.connect(DB) as db:
+        async with db.execute("SELECT enabled FROM ia_enabled_channels WHERE channel_id = ?", (channel_id,)) as c:
+            row = await c.fetchone()
+    if row is None:
+        return False  # Desativado por padrão
+    return bool(row[0])
+
+async def set_ia_enabled(channel_id: str, enabled: bool):
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO ia_enabled_channels (channel_id, enabled) VALUES (?, ?)",
+            (channel_id, 1 if enabled else 0)
+        )
+        await db.commit()
+
 # ──────────────────────────────────────────────────────────────
-#  TASK — VERIFICAR LEMBRETES A CADA 30 SEGUNDOS
+#  TASK — VERIFICAR LEMBRETES
 # ──────────────────────────────────────────────────────────────
 @tasks.loop(seconds=30)
 async def check_reminders():
@@ -819,9 +837,198 @@ class RemoveSessionView(discord.ui.View):
         await itx.response.send_modal(modal)
 
 # ──────────────────────────────────────────────────────────────
-#  SLASH COMMANDS
+#  COMANDOS DE CONTROLE DA IA POR CANAL
 # ──────────────────────────────────────────────────────────────
+@bot.tree.command(name="ativar", description="Ativa as respostas automáticas da IA neste canal")
+@app_commands.default_permissions(administrator=True)
+async def cmd_ativar(itx: discord.Interaction):
+    channel_id = str(itx.channel_id)
+    await set_ia_enabled(channel_id, True)
+    embed = discord.Embed(
+        title="✅ IA Ativada",
+        description=f"A IA agora vai responder automaticamente neste canal.\n\nUse `/desativar` para desligar.",
+        color=0x2ECC71
+    )
+    await itx.response.send_message(embed=embed, ephemeral=True)
 
+@bot.tree.command(name="desativar", description="Desativa as respostas automáticas da IA neste canal")
+@app_commands.default_permissions(administrator=True)
+async def cmd_desativar(itx: discord.Interaction):
+    channel_id = str(itx.channel_id)
+    await set_ia_enabled(channel_id, False)
+    embed = discord.Embed(
+        title="❌ IA Desativada",
+        description=f"A IA não vai mais responder automaticamente neste canal.\n\nUse `/ativar` para reativar.",
+        color=0xE74C3C
+    )
+    await itx.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="status_ia", description="Verifica se a IA está ativa neste canal")
+async def cmd_status_ia(itx: discord.Interaction):
+    channel_id = str(itx.channel_id)
+    enabled = await is_ia_enabled(channel_id)
+    status = "✅ **Ativa**" if enabled else "❌ **Inativa**"
+    embed = discord.Embed(
+        title="📊 Status da IA neste canal",
+        description=f"A IA está {status}.",
+        color=0x2ECC71 if enabled else 0xE74C3C
+    )
+    embed.add_field(name="Comandos", value="Use `/ativar` para ligar e `/desativar` para desligar.", inline=False)
+    await itx.response.send_message(embed=embed, ephemeral=True)
+
+# ──────────────────────────────────────────────────────────────
+#  COMANDO /ia (manual)
+# ──────────────────────────────────────────────────────────────
+@bot.tree.command(name="ia", description="Faça uma pergunta para a IA (com contexto do chat)")
+@app_commands.describe(pergunta="Sua pergunta")
+async def cmd_ia(itx: discord.Interaction, pergunta: str):
+    if not GEMINI_API_KEY:
+        return await itx.response.send_message("❌ IA não configurada.", ephemeral=True)
+    if not GEMINI_MODELS:
+        return await itx.response.send_message("❌ Nenhum modelo disponível.", ephemeral=True)
+
+    await itx.response.defer(ephemeral=False)
+
+    try:
+        channel_history = await get_channel_history(str(itx.channel_id), limit=20)
+        user_history = await get_user_history(str(itx.user.id), limit=10)
+
+        contexto = (
+            "Você é um assistente virtual do Hospital ECCO em um servidor FiveM. "
+            "Responda de forma educada, objetiva e dentro do contexto hospitalar e de RPG. "
+            "Use as informações abaixo para contextualizar sua resposta.\n\n"
+        )
+
+        if channel_history:
+            contexto += "--- Histórico recente do canal ---\n"
+            for entry in channel_history:
+                uid, msg, resp, ts = entry
+                user = bot.get_user(int(uid))
+                nome = user.display_name if user else uid
+                if resp:
+                    contexto += f"{nome}: {msg}\nBot: {resp}\n"
+                else:
+                    contexto += f"{nome}: {msg}\n"
+            contexto += "\n"
+
+        if user_history:
+            contexto += "--- Seu histórico recente comigo ---\n"
+            for entry in user_history:
+                msg, resp, ts = entry
+                contexto += f"Você: {msg}\n"
+                if resp:
+                    contexto += f"Eu: {resp}\n"
+            contexto += "\n"
+
+        contexto += f"Pergunta atual: {pergunta}\n\n"
+
+        resposta_texto = None
+        ultimo_erro = None
+        for modelo in GEMINI_MODELS:
+            try:
+                model = genai.GenerativeModel(modelo)
+                resposta = model.generate_content(contexto)
+                resposta_texto = resposta.text.strip()
+                break
+            except Exception as e:
+                ultimo_erro = e
+                continue
+
+        if resposta_texto is None:
+            try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+                payload = {
+                    "contents": [{"parts": [{"text": contexto}]}]
+                }
+                response = requests.post(url, json=payload, timeout=30)
+                if response.status_code == 200:
+                    data = response.json()
+                    if "candidates" in data and data["candidates"]:
+                        resposta_texto = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                else:
+                    ultimo_erro = f"REST {response.status_code}"
+            except Exception as e:
+                ultimo_erro = f"REST falhou: {e}"
+
+        if resposta_texto is None:
+            raise Exception(f"Falha ao gerar resposta. Último erro: {ultimo_erro}")
+
+        await save_conversation(
+            user_id=str(itx.user.id),
+            channel_id=str(itx.channel_id),
+            message=pergunta,
+            response=resposta_texto
+        )
+
+        if len(resposta_texto) > 1900:
+            resposta_texto = resposta_texto[:1900] + "…"
+
+        embed = discord.Embed(
+            title="🤖 Resposta da IA",
+            description=resposta_texto,
+            color=0x00D4FF,
+        )
+        embed.set_footer(text=f"Pergunta de {itx.user.display_name}", icon_url=itx.user.display_avatar.url)
+        await itx.followup.send(embed=embed)
+
+    except Exception as e:
+        await itx.followup.send(f"❌ Erro: {str(e)[:200]}")
+
+# ──────────────────────────────────────────────────────────────
+#  COMANDO /lembrar
+# ──────────────────────────────────────────────────────────────
+@bot.tree.command(name="lembrar", description="Agenda um lembrete para você ou para outro usuário")
+@app_commands.describe(
+    mensagem="O que deseja lembrar",
+    data="Data no formato DD/MM/AAAA",
+    hora="Hora no formato HH:MM (24h)",
+    usuario="Usuário que receberá o lembrete (opcional)"
+)
+async def cmd_lembrar(
+    itx: discord.Interaction,
+    mensagem: str,
+    data: str,
+    hora: str,
+    usuario: discord.Member = None
+):
+    try:
+        dt_str = f"{data} {hora}"
+        remind_dt = parse_datetime_br(dt_str)
+        if remind_dt < now_br():
+            return await itx.response.send_message("❌ A data/hora deve ser no futuro.", ephemeral=True)
+    except ValueError as e:
+        return await itx.response.send_message(f"❌ Formato inválido: {e}", ephemeral=True)
+
+    target_user = usuario if usuario else itx.user
+    target_id = str(target_user.id)
+
+    await add_reminder(
+        user_id=target_id,
+        channel_id=str(itx.channel_id),
+        message=mensagem,
+        remind_at=remind_dt
+    )
+
+    embed = discord.Embed(
+        title="✅ Lembrete agendado!",
+        description=(
+            f"**{mensagem}**\n\n"
+            f"⏰ **{remind_dt.strftime('%d/%m/%Y às %H:%M')}**\n"
+            f"📌 Para: {target_user.mention}"
+        ),
+        color=0x2ECC71
+    )
+    embed.set_footer(text="Você receberá uma notificação na hora.")
+    await itx.response.send_message(embed=embed, ephemeral=True)
+
+    if usuario:
+        await itx.channel.send(
+            f"🔔 {itx.user.mention} agendou um lembrete para {usuario.mention} às **{remind_dt.strftime('%H:%M')}** do dia **{remind_dt.strftime('%d/%m/%Y')}**."
+        )
+
+# ──────────────────────────────────────────────────────────────
+#  COMANDOS EXISTENTES (bate ponto, ranking, etc.)
+# ──────────────────────────────────────────────────────────────
 @bot.tree.command(name="setup_ponto", description="[ADMIN] Recria o painel de bate ponto")
 @app_commands.default_permissions(administrator=True)
 async def cmd_setup(itx: discord.Interaction):
@@ -1049,157 +1256,7 @@ async def cmd_ajustar_horario(itx: discord.Interaction, colaborador: discord.Mem
     await itx.response.send_message(embed=embed, view=view, ephemeral=True)
 
 # ──────────────────────────────────────────────────────────────
-#  COMANDO /lembrar — com menção a usuário
-# ──────────────────────────────────────────────────────────────
-@bot.tree.command(name="lembrar", description="Agenda um lembrete para você ou para outro usuário")
-@app_commands.describe(
-    mensagem="O que deseja lembrar",
-    data="Data no formato DD/MM/AAAA",
-    hora="Hora no formato HH:MM (24h)",
-    usuario="Usuário que receberá o lembrete (opcional)"
-)
-async def cmd_lembrar(
-    itx: discord.Interaction,
-    mensagem: str,
-    data: str,
-    hora: str,
-    usuario: discord.Member = None
-):
-    try:
-        dt_str = f"{data} {hora}"
-        remind_dt = parse_datetime_br(dt_str)
-        if remind_dt < now_br():
-            return await itx.response.send_message("❌ A data/hora deve ser no futuro.", ephemeral=True)
-    except ValueError as e:
-        return await itx.response.send_message(f"❌ Formato inválido: {e}", ephemeral=True)
-
-    target_user = usuario if usuario else itx.user
-    target_id = str(target_user.id)
-
-    await add_reminder(
-        user_id=target_id,
-        channel_id=str(itx.channel_id),
-        message=mensagem,
-        remind_at=remind_dt
-    )
-
-    embed = discord.Embed(
-        title="✅ Lembrete agendado!",
-        description=(
-            f"**{mensagem}**\n\n"
-            f"⏰ **{remind_dt.strftime('%d/%m/%Y às %H:%M')}**\n"
-            f"📌 Para: {target_user.mention}"
-        ),
-        color=0x2ECC71
-    )
-    embed.set_footer(text="Você receberá uma notificação na hora.")
-    await itx.response.send_message(embed=embed, ephemeral=True)
-
-    if usuario:
-        await itx.channel.send(
-            f"🔔 {itx.user.mention} agendou um lembrete para {usuario.mention} às **{remind_dt.strftime('%H:%M')}** do dia **{remind_dt.strftime('%d/%m/%Y')}**."
-        )
-
-# ──────────────────────────────────────────────────────────────
-#  COMANDO /ia — com contexto e memória
-# ──────────────────────────────────────────────────────────────
-@bot.tree.command(name="ia", description="Faça uma pergunta para a IA (com contexto do chat)")
-@app_commands.describe(pergunta="Sua pergunta")
-async def cmd_ia(itx: discord.Interaction, pergunta: str):
-    if not GEMINI_API_KEY:
-        return await itx.response.send_message("❌ IA não configurada.", ephemeral=True)
-    if not GEMINI_MODELS:
-        return await itx.response.send_message("❌ Nenhum modelo disponível.", ephemeral=True)
-
-    await itx.response.defer(ephemeral=False)
-
-    try:
-        channel_history = await get_channel_history(str(itx.channel_id), limit=20)
-        user_history = await get_user_history(str(itx.user.id), limit=10)
-
-        contexto = (
-            "Você é um assistente virtual do Hospital ECCO em um servidor FiveM. "
-            "Responda de forma educada, objetiva e dentro do contexto hospitalar e de RPG. "
-            "Use as informações abaixo para contextualizar sua resposta.\n\n"
-        )
-
-        if channel_history:
-            contexto += "--- Histórico recente do canal ---\n"
-            for entry in channel_history:
-                uid, msg, resp, ts = entry
-                user = bot.get_user(int(uid))
-                nome = user.display_name if user else uid
-                if resp:
-                    contexto += f"{nome}: {msg}\nBot: {resp}\n"
-                else:
-                    contexto += f"{nome}: {msg}\n"
-            contexto += "\n"
-
-        if user_history:
-            contexto += "--- Seu histórico recente comigo ---\n"
-            for entry in user_history:
-                msg, resp, ts = entry
-                contexto += f"Você: {msg}\n"
-                if resp:
-                    contexto += f"Eu: {resp}\n"
-            contexto += "\n"
-
-        contexto += f"Pergunta atual: {pergunta}\n\n"
-
-        resposta_texto = None
-        ultimo_erro = None
-        for modelo in GEMINI_MODELS:
-            try:
-                model = genai.GenerativeModel(modelo)
-                resposta = model.generate_content(contexto)
-                resposta_texto = resposta.text.strip()
-                break
-            except Exception as e:
-                ultimo_erro = e
-                continue
-
-        if resposta_texto is None:
-            try:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
-                payload = {
-                    "contents": [{"parts": [{"text": contexto}]}]
-                }
-                response = requests.post(url, json=payload, timeout=30)
-                if response.status_code == 200:
-                    data = response.json()
-                    if "candidates" in data and data["candidates"]:
-                        resposta_texto = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                else:
-                    ultimo_erro = f"REST {response.status_code}"
-            except Exception as e:
-                ultimo_erro = f"REST falhou: {e}"
-
-        if resposta_texto is None:
-            raise Exception(f"Falha ao gerar resposta. Último erro: {ultimo_erro}")
-
-        await save_conversation(
-            user_id=str(itx.user.id),
-            channel_id=str(itx.channel_id),
-            message=pergunta,
-            response=resposta_texto
-        )
-
-        if len(resposta_texto) > 1900:
-            resposta_texto = resposta_texto[:1900] + "…"
-
-        embed = discord.Embed(
-            title="🤖 Resposta da IA",
-            description=resposta_texto,
-            color=0x00D4FF,
-        )
-        embed.set_footer(text=f"Pergunta de {itx.user.display_name}", icon_url=itx.user.display_avatar.url)
-        await itx.followup.send(embed=embed)
-
-    except Exception as e:
-        await itx.followup.send(f"❌ Erro: {str(e)[:200]}")
-
-# ──────────────────────────────────────────────────────────────
-#  EVENTO on_message — RESPOSTAS AUTOMÁTICAS (sem comando)
+#  EVENTO on_message — RESPOSTAS AUTOMÁTICAS EM CANAIS ATIVADOS
 # ──────────────────────────────────────────────────────────────
 @bot.event
 async def on_message(msg: discord.Message):
@@ -1207,84 +1264,91 @@ async def on_message(msg: discord.Message):
     if msg.author.bot:
         return
 
-    # Se for no canal configurado e não for comando, responde automaticamente
-    if IA_CHANNEL_ID and msg.channel.id == IA_CHANNEL_ID and not msg.content.startswith("!"):
-        if not GEMINI_API_KEY or not GEMINI_MODELS:
-            return
-        if msg.content.startswith("/"):
-            return
+    # Ignora comandos (com / ou !)
+    if msg.content.startswith(("/", "!")):
+        await bot.process_commands(msg)
+        return
 
-        async with msg.channel.typing():
-            try:
-                # Busca histórico do canal para contexto
-                channel_history = await get_channel_history(str(msg.channel.id), limit=15)
-                user_history = await get_user_history(str(msg.author.id), limit=5)
+    # Verifica se a IA está ativa neste canal
+    channel_id = str(msg.channel.id)
+    if not await is_ia_enabled(channel_id):
+        await bot.process_commands(msg)
+        return
 
-                contexto = (
-                    "Você é um assistente do Hospital ECCO. Responda de forma breve e útil, "
-                    "como se fosse um profissional da saúde ajudando a equipe. "
-                    "Máximo de 300 caracteres.\n\n"
+    # Verifica se a IA está configurada
+    if not GEMINI_API_KEY or not GEMINI_MODELS:
+        await bot.process_commands(msg)
+        return
+
+    # Processa a mensagem automaticamente
+    async with msg.channel.typing():
+        try:
+            # Busca histórico do canal (últimas 20 mensagens)
+            channel_history = await get_channel_history(str(msg.channel.id), limit=20)
+
+            # Monta contexto com histórico
+            contexto = (
+                "Você é um assistente virtual do Hospital ECCO em um servidor FiveM. "
+                "Responda de forma breve, educada e útil. Máximo de 500 caracteres. "
+                "Seja direto e objetivo.\n\n"
+            )
+
+            if channel_history:
+                contexto += "--- Histórico recente do canal ---\n"
+                for entry in channel_history:
+                    uid, m, r, ts = entry
+                    user = bot.get_user(int(uid))
+                    nome = user.display_name if user else uid
+                    if r:
+                        contexto += f"{nome}: {m}\nBot: {r}\n"
+                    else:
+                        contexto += f"{nome}: {m}\n"
+                contexto += "\n"
+
+            contexto += f"Usuário {msg.author.display_name}: {msg.content}"
+
+            # Gerar resposta com Gemini
+            resposta_texto = None
+            for modelo in GEMINI_MODELS:
+                try:
+                    model = genai.GenerativeModel(modelo)
+                    resposta = model.generate_content(contexto)
+                    resposta_texto = resposta.text.strip()
+                    break
+                except Exception:
+                    continue
+
+            # Fallback REST
+            if resposta_texto is None:
+                try:
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+                    payload = {"contents": [{"parts": [{"text": contexto}]}]}
+                    response = requests.post(url, json=payload, timeout=30)
+                    if response.status_code == 200:
+                        data = response.json()
+                        if "candidates" in data and data["candidates"]:
+                            resposta_texto = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                except Exception:
+                    pass
+
+            if resposta_texto:
+                # Salvar conversa no banco
+                await save_conversation(
+                    user_id=str(msg.author.id),
+                    channel_id=str(msg.channel.id),
+                    message=msg.content,
+                    response=resposta_texto
                 )
 
-                if channel_history:
-                    contexto += "--- Histórico recente do canal ---\n"
-                    for entry in channel_history:
-                        uid, m, r, ts = entry
-                        user = bot.get_user(int(uid))
-                        nome = user.display_name if user else uid
-                        if r:
-                            contexto += f"{nome}: {m}\nBot: {r}\n"
-                        else:
-                            contexto += f"{nome}: {m}\n"
-                    contexto += "\n"
+                # Enviar resposta
+                if len(resposta_texto) > 1900:
+                    resposta_texto = resposta_texto[:1900] + "…"
+                await msg.reply(resposta_texto, mention_author=False)
 
-                if user_history:
-                    contexto += "--- Histórico do usuário ---\n"
-                    for entry in user_history:
-                        m, r, ts = entry
-                        contexto += f"Usuário: {m}\n"
-                        if r:
-                            contexto += f"Bot: {r}\n"
-                    contexto += "\n"
+        except Exception:
+            pass
 
-                contexto += f"Usuário: {msg.content}"
-
-                resposta_texto = None
-                for modelo in GEMINI_MODELS:
-                    try:
-                        model = genai.GenerativeModel(modelo)
-                        resposta = model.generate_content(contexto)
-                        resposta_texto = resposta.text.strip()
-                        break
-                    except Exception:
-                        continue
-
-                if resposta_texto is None:
-                    try:
-                        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
-                        payload = {"contents": [{"parts": [{"text": contexto}]}]}
-                        response = requests.post(url, json=payload, timeout=30)
-                        if response.status_code == 200:
-                            data = response.json()
-                            if "candidates" in data and data["candidates"]:
-                                resposta_texto = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                    except Exception:
-                        pass
-
-                if resposta_texto:
-                    # Salva a conversa no banco
-                    await save_conversation(
-                        user_id=str(msg.author.id),
-                        channel_id=str(msg.channel.id),
-                        message=msg.content,
-                        response=resposta_texto
-                    )
-                    await msg.reply(resposta_texto[:1900], mention_author=False)
-
-            except Exception as e:
-                print(f"❌ Erro na resposta automática: {e}")
-
-    # Processa comandos
+    # Processar comandos (caso tenha algum)
     await bot.process_commands(msg)
 
 # ──────────────────────────────────────────────────────────────
@@ -1338,7 +1402,6 @@ async def on_ready():
     bot.add_view(RemovePanelView())
     bot.add_view(RecruitView())
 
-    # Painel principal
     ch_panel = bot.get_channel(PANEL_CHANNEL)
     if ch_panel:
         mid_panel = await load_mid("panel")
@@ -1356,7 +1419,6 @@ async def on_ready():
     else:
         print(f"⚠️ Canal do painel ({PANEL_CHANNEL}) não encontrado.")
 
-    # Painel de remoção
     ch_remove = bot.get_channel(REMOVE_PANEL_CHANNEL)
     if ch_remove:
         mid_remove = await load_mid("remove_panel")
@@ -1385,7 +1447,6 @@ async def on_ready():
     else:
         print(f"⚠️ Canal de remoção ({REMOVE_PANEL_CHANNEL}) não encontrado.")
 
-    # Painel de recrutamento
     ch_recruit = bot.get_channel(RECRUIT_CHANNEL)
     if ch_recruit:
         mid_recruit = await load_mid("recruit_panel")
@@ -1414,7 +1475,6 @@ async def on_ready():
     else:
         print(f"⚠️ Canal de recrutamento ({RECRUIT_CHANNEL}) não encontrado.")
 
-    # Ranking
     ch_rank = bot.get_channel(RANK_CHANNEL)
     if not ch_rank:
         print(f"⚠️ Canal de ranking ({RANK_CHANNEL}) não encontrado.")
@@ -1425,13 +1485,15 @@ async def on_ready():
     notify_active_users.start()
     check_reminders.start()
 
-    print(f"✅ {bot.user} (ID: {bot.user.id}) online!")
-    print(f"   {len(bot.tree.get_commands())} slash commands sincronizados")
-    print(f"   {len(bot.guilds)} servidor(es)")
-    if IA_CHANNEL_ID:
-        print(f"   🤖 Respostas automáticas ativas no canal {IA_CHANNEL_ID}")
-    else:
-        print("   ⚠️ Respostas automáticas desativadas (defina IA_CHANNEL_ID)")
+    try:
+        synced = await bot.tree.sync()
+        print(
+            f"✅ {bot.user} (ID: {bot.user.id}) online!\n"
+            f"    {len(synced)} slash commands sincronizados\n"
+            f"    {len(bot.guilds)} servidor(es)"
+        )
+    except Exception as exc:
+        print(f"❌ Erro ao sincronizar slash commands: {exc}")
 
 # ──────────────────────────────────────────────────────────────
 #  ENTRY POINT
