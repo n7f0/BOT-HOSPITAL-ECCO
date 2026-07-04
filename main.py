@@ -18,20 +18,22 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 # ──────────────────────────────────────────────────────────────
-#  CONFIGURAÇÃO DA IA (GEMINI)
+#  CONFIGURAÇÃO DA IA (GEMINI - novo pacote google.genai)
 # ──────────────────────────────────────────────────────────────
-import google.generativeai as genai
+from google import genai
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    try:
-        GEMINI_MODEL = genai.GenerativeModel("gemini-1.5-flash")
-    except Exception:
-        # Fallback para modelo mais antigo e amplamente disponível
-        GEMINI_MODEL = genai.GenerativeModel("gemini-1.0-pro")
+    GEMINI_CLIENT = genai.Client(api_key=GEMINI_API_KEY)
+    # Lista de modelos em ordem de preferência
+    GEMINI_MODELS = [
+        "gemini-2.0-flash",   # mais recente e rápido
+        "gemini-1.5-flash",   # fallback
+        "gemini-1.0-pro"      # último fallback
+    ]
 else:
-    GEMINI_MODEL = None
+    GEMINI_CLIENT = None
+    GEMINI_MODELS = []
 
 # ──────────────────────────────────────────────────────────────
 #  CONFIGURAÇÃO DO BOT
