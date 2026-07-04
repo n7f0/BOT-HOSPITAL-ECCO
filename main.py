@@ -1,6 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║          ECCO HOSPITAL CENTER — BOT DE BATE PONTO           ║
+║                     + IA GEMINI GRATUITA                    ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -17,7 +18,22 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 # ──────────────────────────────────────────────────────────────
-#  CONFIGURAÇÃO
+#  CONFIGURAÇÃO DA IA (GEMINI)
+# ──────────────────────────────────────────────────────────────
+import google.generativeai as genai
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    GEMINI_MODEL = genai.GenerativeModel("gemini-1.5-flash")
+else:
+    GEMINI_MODEL = None
+
+# Canal opcional para respostas automáticas (defina o ID ou None)
+IA_CHANNEL_ID = None  # Exemplo: 123456789012345678
+
+# ──────────────────────────────────────────────────────────────
+#  CONFIGURAÇÃO DO BOT
 # ──────────────────────────────────────────────────────────────
 TOKEN         = os.environ.get("DISCORD_TOKEN")
 PANEL_CHANNEL = int(os.environ.get("PANEL_CHANNEL_ID", "1515846128493658142"))
@@ -412,7 +428,6 @@ class PunchView(discord.ui.View):
             le.add_field(name="Entrada",     value=open_dt.strftime("%d/%m/%Y às %H:%M:%S"),      inline=True)
             le.add_field(name="Saída",       value=now.strftime("%d/%m/%Y às %H:%M:%S"),          inline=True)
             le.add_field(name="Duração",     value=f"**{hms(dur_sec)}**",                         inline=True)
-            le.set_thumbnail(url=str(itx.user.display_avatar.url))
             le.set_footer(text="ECCO HOSPITAL CENTER")
             await lch.send(embed=le)
 
@@ -1254,6 +1269,45 @@ async def cmd_ajustar_horario(itx: discord.Interaction, colaborador: discord.Mem
 
 
 # ──────────────────────────────────────────────────────────────
+#  COMANDO /ia — Perguntar à IA (GEMINI)
+# ──────────────────────────────────────────────────────────────
+@bot.tree.command(name="ia", description="Faça uma pergunta para a IA do Hospital ECCO")
+@app_commands.describe(pergunta="Sua pergunta para a IA")
+async def cmd_ia(itx: discord.Interaction, pergunta: str):
+    if not GEMINI_API_KEY or GEMINI_MODEL is None:
+        return await itx.response.send_message(
+            "❌ A IA não está configurada. Contate um administrador.",
+            ephemeral=True
+        )
+
+    await itx.response.defer(ephemeral=False)
+
+    try:
+        # Contexto personalizado para o hospital
+        contexto = (
+            "Você é um assistente virtual do Hospital ECCO em um servidor FiveM. "
+            "Responda de forma educada, objetiva e dentro do contexto hospitalar e de RPG. "
+            "Máximo de 500 caracteres."
+        )
+        resposta = GEMINI_MODEL.generate_content(f"{contexto}\n\nPergunta: {pergunta}")
+        texto = resposta.text.strip()
+
+        if len(texto) > 1900:
+            texto = texto[:1900] + "…"
+
+        embed = discord.Embed(
+            title="🤖 Resposta da IA",
+            description=texto,
+            color=0x00D4FF,
+        )
+        embed.set_footer(text=f"Pergunta de {itx.user.display_name}", icon_url=itx.user.display_avatar.url)
+        await itx.followup.send(embed=embed)
+
+    except Exception as e:
+        await itx.followup.send(f"❌ Erro ao processar sua pergunta: {str(e)[:100]}")
+
+
+# ──────────────────────────────────────────────────────────────
 #  VIEW — REMOVER HORAS (com select, usado pelo comando /remover_horas)
 # ──────────────────────────────────────────────────────────────
 
@@ -1400,6 +1454,41 @@ class RemoveSessionView(discord.ui.View):
 
         modal = RemoveHoursModalSelect(self.selected_session_id, self.user)
         await itx.response.send_modal(modal)
+
+
+# ──────────────────────────────────────────────────────────────
+#  EVENTO OPCIONAL — RESPOSTA AUTOMÁTICA EM CANAL ESPECÍFICO
+# ──────────────────────────────────────────────────────────────
+@bot.event
+async def on_message(msg: discord.Message):
+    # Ignora mensagens do próprio bot
+    if msg.author.bot:
+        return
+
+    # Se o canal for o definido e não for um comando
+    if IA_CHANNEL_ID and msg.channel.id == IA_CHANNEL_ID and not msg.content.startswith("!"):
+        if not GEMINI_API_KEY or GEMINI_MODEL is None:
+            return
+
+        # Evita responder a comandos slash (já tratados separadamente)
+        if msg.content.startswith("/"):
+            return
+
+        async with msg.channel.typing():
+            try:
+                contexto = (
+                    "Você é um assistente do Hospital ECCO em um servidor FiveM. "
+                    "Responda de forma breve e útil. Máximo de 300 caracteres."
+                )
+                resposta = GEMINI_MODEL.generate_content(f"{contexto}\n\nUsuário: {msg.content}")
+                texto = resposta.text.strip()
+                if texto:
+                    await msg.reply(texto[:1900], mention_author=False)
+            except Exception:
+                pass
+
+    # Importante: processar comandos depois
+    await bot.process_commands(msg)
 
 
 # ──────────────────────────────────────────────────────────────
