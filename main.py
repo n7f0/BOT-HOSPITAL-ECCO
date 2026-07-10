@@ -11,8 +11,7 @@ import datetime
 import os
 import re
 import logging
-import json
-from collections import defaultdict
+import time
 
 import aiosqlite
 import discord
@@ -37,10 +36,9 @@ TOKEN         = os.environ.get("DISCORD_TOKEN")
 PANEL_CHANNEL = int(os.environ.get("PANEL_CHANNEL_ID", "1515846128493658142"))
 RANK_CHANNEL  = int(os.environ.get("RANK_CHANNEL_ID", "1515852084480839850"))
 LOGS_CHANNEL  = int(os.environ.get("LOGS_CHANNEL_ID",  "1515846898156834956"))
+REMOVE_PANEL_CHANNEL = int(os.environ.get("REMOVE_PANEL_CHANNEL_ID", "1515846758456885400"))
 DB            = os.environ.get("DB_PATH", "ponto.db")
 BR_TZ         = pytz.timezone("America/Sao_Paulo")
-
-REMOVE_PANEL_CHANNEL = 1515846758456885400  # ID do canal do painel de remoção
 
 # Cargos autorizados para remover horas
 AUTHORIZED_REMOVE_ROLE_IDS = [
@@ -139,7 +137,6 @@ def hms(sec: float) -> str:
     return f"{h:02d}h {m:02d}m {s:02d}s"
 
 def extract_user_id(text: str) -> int:
-    """Extrai ID de uma menção <@!...> ou número puro."""
     match = re.search(r'<@!?(\d+)>', text)
     if match:
         return int(match.group(1))
