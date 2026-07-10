@@ -1,8 +1,8 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║          ECCO HOSPITAL CENTER — BOT DE BATE PONTO           ║
-║                VERSÃO OTIMIZADA (SEM IA/RECRUTA)            ║
-║           COMANDOS: /meu_ponto /sync                        ║
+║         VERSÃO COM ARMAZENAMENTO EM MEMÓRIA (RAM)           ║
+║            OS DADOS SÃO PERDIDOS AO REINICIAR               ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -12,8 +12,8 @@ import os
 import re
 import logging
 import time
+from typing import Dict, List, Optional
 
-import aiosqlite
 import discord
 import pytz
 from discord import app_commands
@@ -37,7 +37,6 @@ PANEL_CHANNEL = int(os.environ.get("PANEL_CHANNEL_ID", "1515846128493658142"))
 RANK_CHANNEL  = int(os.environ.get("RANK_CHANNEL_ID", "1515852084480839850"))
 LOGS_CHANNEL  = int(os.environ.get("LOGS_CHANNEL_ID",  "1515846898156834956"))
 REMOVE_PANEL_CHANNEL = int(os.environ.get("REMOVE_PANEL_CHANNEL_ID", "1515846758456885400"))
-DB            = os.environ.get("DB_PATH", "ponto.db")
 BR_TZ         = pytz.timezone("America/Sao_Paulo")
 
 # Cargos autorizados para remover horas
@@ -56,67 +55,20 @@ _rank_lock = asyncio.Lock()
 _last_update: float = 0.0
 
 # ──────────────────────────────────────────────────────────────
-#  GERENCIADOR DE BANCO DE DADOS
+#  ARMAZENAMENTO EM MEMÓRIA
 # ──────────────────────────────────────────────────────────────
-class DatabaseManager:
-    def __init__(self, db_path):
-        self.db_path = db_path
-        self.conn = None
+# active_sessions: user_id -> {"name": str, "open_time": datetime}
+active_sessions: Dict[str, Dict] = {}
 
-    async def connect(self):
-        if not self.conn:
-            db_dir = os.path.dirname(os.path.abspath(self.db_path))
-            if db_dir:
-                os.makedirs(db_dir, exist_ok=True)
-            self.conn = await aiosqlite.connect(self.db_path)
-            logger.info("Conexão com o banco de dados estabelecida.")
+# closed_sessions: lista de dicionários com os campos:
+#   user_id, user_name, open_time, close_time, dur_sec, week_start
+closed_sessions: List[Dict] = []
 
-    async def execute(self, query, params=()):
-        await self.connect()
-        return await self.conn.execute(query, params)
+# msg_store: key -> message_id (para os painéis fixos)
+msg_store: Dict[str, int] = {}
 
-    async def executescript(self, script):
-        await self.connect()
-        await self.conn.executescript(script)
-
-    async def commit(self):
-        if self.conn:
-            await self.conn.commit()
-
-    async def fetchone(self, query, params=()):
-        await self.connect()
-        async with self.conn.execute(query, params) as cursor:
-            return await cursor.fetchone()
-
-    async def fetchall(self, query, params=()):
-        await self.connect()
-        async with self.conn.execute(query, params) as cursor:
-            return await cursor.fetchall()
-
-db = DatabaseManager(DB)
-
-async def init_db():
-    await db.executescript("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id    TEXT    NOT NULL,
-            user_name  TEXT    NOT NULL,
-            open_time  TEXT    NOT NULL,
-            close_time TEXT,
-            dur_sec    INTEGER,
-            week_start TEXT    NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS active (
-            user_id   TEXT PRIMARY KEY,
-            user_name TEXT NOT NULL,
-            open_time TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS msg_store (
-            key        TEXT PRIMARY KEY,
-            message_id TEXT NOT NULL
-        );
-    """)
-    await db.commit()
+# Contador para IDs das sessões (apenas para referência interna, não usado)
+_session_counter = 0
 
 # ──────────────────────────────────────────────────────────────
 #  FUNÇÕES AUXILIARES
@@ -145,33 +97,42 @@ def extract_user_id(text: str) -> int:
     except ValueError:
         return None
 
-async def load_mid(key: str):
-    row = await db.fetchone("SELECT message_id FROM msg_store WHERE key = ?", (key,))
-    return int(row[0]) if row else None
+async def load_mid(key: str) -> Optional[int]:
+    return msg_store.get(key)
 
 async def save_mid(key: str, msg_id: int):
-    await db.execute("INSERT OR REPLACE INTO msg_store VALUES (?, ?)", (key, str(msg_id)))
-    await db.commit()
+    msg_store[key] = msg_id
 
 async def get_rank() -> list:
-    ws = week_monday().isoformat()
-    totals_raw = await db.fetchall(
-        "SELECT user_id, user_name, SUM(dur_sec) FROM sessions WHERE week_start >= ? AND close_time IS NOT NULL GROUP BY user_id",
-        (ws,)
-    )
-    totals = {r[0]: [r[1], r[2] or 0] for r in totals_raw}
-    actives = await db.fetchall("SELECT user_id, user_name, open_time FROM active")
+    """
+    Retorna lista de (user_id, [user_name, total_seconds]) ordenada por total decrescente.
+    """
     now = now_br()
+    ws = week_monday().isoformat()
 
-    for uid, uname, ot in actives:
-        dt = BR_TZ.localize(datetime.datetime.fromisoformat(ot))
+    # Soma das sessões fechadas
+    totals = {}
+    for sess in closed_sessions:
+        if sess["week_start"] >= ws:
+            uid = sess["user_id"]
+            if uid not in totals:
+                totals[uid] = [sess["user_name"], 0]
+            totals[uid][1] += sess["dur_sec"]
+
+    # Soma das sessões ativas
+    for uid, data in active_sessions.items():
+        dt = data["open_time"]  # já é datetime com timezone
         elapsed = (now - dt).total_seconds()
         if uid in totals:
             totals[uid][1] += elapsed
         else:
-            totals[uid] = [uname, elapsed]
+            totals[uid] = [data["name"], elapsed]
 
     return sorted(totals.items(), key=lambda x: x[1][1], reverse=True)
+
+async def get_user_sessions(user_id: str, week_start: str) -> List[Dict]:
+    """Retorna sessões fechadas de um usuário na semana especificada."""
+    return [s for s in closed_sessions if s["user_id"] == user_id and s["week_start"] >= week_start]
 
 # ──────────────────────────────────────────────────────────────
 #  PAINÉIS EMBEDS
@@ -212,8 +173,7 @@ async def rank_embed() -> discord.Embed:
     ws = week_monday(now)
     we = ws + datetime.timedelta(days=6)
 
-    active_row = await db.fetchone("SELECT COUNT(*) FROM active")
-    active_n = active_row[0] if active_row else 0
+    active_n = len(active_sessions)
 
     e = discord.Embed(
         title="🏆 RANKING SEMANAL DE HORAS",
@@ -295,10 +255,12 @@ class PunchView(discord.ui.View):
 
     @discord.ui.button(label="✅  Abrir Ponto", style=discord.ButtonStyle.success, custom_id="ecco:open")
     async def open_btn(self, itx: discord.Interaction, _: discord.ui.Button):
-        uid, name, now = str(itx.user.id), itx.user.display_name, now_br()
-        row = await db.fetchone("SELECT open_time FROM active WHERE user_id = ?", (uid,))
-        if row:
-            dt = BR_TZ.localize(datetime.datetime.fromisoformat(row[0]))
+        uid = str(itx.user.id)
+        name = itx.user.display_name
+        now = now_br()
+
+        if uid in active_sessions:
+            dt = active_sessions[uid]["open_time"]
             e = discord.Embed(
                 title="⚠️ Ponto Já Aberto!",
                 description=(
@@ -310,11 +272,7 @@ class PunchView(discord.ui.View):
             )
             return await itx.response.send_message(embed=e, ephemeral=True)
 
-        await db.execute(
-            "INSERT OR REPLACE INTO active (user_id, user_name, open_time) VALUES (?, ?, ?)",
-            (uid, name, now.isoformat())
-        )
-        await db.commit()
+        active_sessions[uid] = {"name": name, "open_time": now}
 
         e = discord.Embed(title="✅ Ponto Aberto com Sucesso!", color=0x2ECC71)
         e.add_field(name="👤 Colaborador", value=f"**{name}**", inline=True)
@@ -331,24 +289,32 @@ class PunchView(discord.ui.View):
 
     @discord.ui.button(label="🔴  Fechar Ponto", style=discord.ButtonStyle.danger, custom_id="ecco:close")
     async def close_btn(self, itx: discord.Interaction, _: discord.ui.Button):
-        uid, name, now = str(itx.user.id), itx.user.display_name, now_br()
-        row = await db.fetchone("SELECT open_time FROM active WHERE user_id = ?", (uid,))
-        if not row:
+        uid = str(itx.user.id)
+        name = itx.user.display_name
+        now = now_br()
+
+        if uid not in active_sessions:
             return await itx.response.send_message(
                 embed=discord.Embed(title="⚠️ Sem Ponto Aberto!", description="Você não tem ponto aberto.", color=0xFFA500),
                 ephemeral=True
             )
 
-        open_dt = BR_TZ.localize(datetime.datetime.fromisoformat(row[0]))
+        open_dt = active_sessions[uid]["open_time"]
         dur_sec = int((now - open_dt).total_seconds())
         ws = week_monday(open_dt).isoformat()
 
-        await db.execute(
-            "INSERT INTO sessions (user_id, user_name, open_time, close_time, dur_sec, week_start) VALUES (?, ?, ?, ?, ?, ?)",
-            (uid, name, row[0], now.isoformat(), dur_sec, ws)
-        )
-        await db.execute("DELETE FROM active WHERE user_id = ?", (uid,))
-        await db.commit()
+        # Registrar sessão fechada
+        closed_sessions.append({
+            "user_id": uid,
+            "user_name": name,
+            "open_time": open_dt.isoformat(),
+            "close_time": now.isoformat(),
+            "dur_sec": dur_sec,
+            "week_start": ws
+        })
+
+        # Remover da lista de ativos
+        del active_sessions[uid]
 
         e = discord.Embed(title="🔴 Ponto Fechado com Sucesso!", color=0xE74C3C)
         e.add_field(name="👤 Colaborador", value=f"**{name}**", inline=False)
@@ -387,17 +353,20 @@ class RemoveHoursAmountModal(discord.ui.Modal):
             return await itx.response.send_message("❌ Valor numérico inválido.", ephemeral=True)
 
         uid = str(self.target_user.id)
-        row = await db.fetchone(
-            "SELECT id, open_time, close_time, dur_sec FROM sessions WHERE user_id = ? AND close_time IS NOT NULL ORDER BY close_time DESC LIMIT 1",
-            (uid,)
-        )
-        if not row:
+
+        # Encontrar a última sessão fechada deste usuário (mais recente)
+        user_sessions = [s for s in closed_sessions if s["user_id"] == uid and s["close_time"] is not None]
+        if not user_sessions:
             return await itx.response.send_message(
                 f"ℹ️ Nenhuma sessão fechada encontrada para {self.target_user.mention}.",
                 ephemeral=True
             )
 
-        session_id, ot, ct, dur = row
+        # Ordenar por close_time decrescente
+        user_sessions.sort(key=lambda s: s["close_time"], reverse=True)
+        last_sess = user_sessions[0]
+
+        dur = last_sess["dur_sec"]
         rem_sec = int(hrs * 3600)
 
         if dur < rem_sec:
@@ -405,20 +374,20 @@ class RemoveHoursAmountModal(discord.ui.Modal):
                 f"❌ A última sessão é muito curta ({hms(dur)}).",
                 ephemeral=True
             )
+
         nova_dur = dur - rem_sec
 
         if nova_dur <= 0:
-            await db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            # Remover completamente a sessão da lista
+            closed_sessions.remove(last_sess)
             msg = "Sessão totalmente removida."
         else:
-            nova_saida = datetime.datetime.fromisoformat(ot) + datetime.timedelta(seconds=nova_dur)
-            await db.execute(
-                "UPDATE sessions SET dur_sec = ?, close_time = ? WHERE id = ?",
-                (nova_dur, nova_saida.isoformat(), session_id)
-            )
+            # Atualizar a duração e o close_time
+            nova_saida = datetime.datetime.fromisoformat(last_sess["open_time"]) + datetime.timedelta(seconds=nova_dur)
+            last_sess["dur_sec"] = nova_dur
+            last_sess["close_time"] = nova_saida.isoformat()
             msg = f"Sessão ajustada para {hms(nova_dur)}."
 
-        await db.commit()
         await itx.response.send_message(f"✅ Sucesso para {self.target_user.mention}: {msg}", ephemeral=True)
         asyncio.create_task(refresh_rank(force=True))
 
@@ -458,21 +427,27 @@ class DMNotifyView(discord.ui.View):
     async def close_from_dm_btn(self, itx: discord.Interaction, _: discord.ui.Button):
         if itx.user.id != self.user_id:
             return
-        uid, name, now = str(itx.user.id), itx.user.display_name, now_br()
-        row = await db.fetchone("SELECT open_time FROM active WHERE user_id = ?", (uid,))
-        if not row:
+        uid = str(itx.user.id)
+        name = itx.user.display_name
+        now = now_br()
+
+        if uid not in active_sessions:
             return await itx.response.send_message("⚠️ Sem ponto aberto.", ephemeral=True)
 
-        open_dt = BR_TZ.localize(datetime.datetime.fromisoformat(row[0]))
+        open_dt = active_sessions[uid]["open_time"]
         dur = int((now - open_dt).total_seconds())
         ws = week_monday(open_dt).isoformat()
 
-        await db.execute(
-            "INSERT INTO sessions (user_id, user_name, open_time, close_time, dur_sec, week_start) VALUES (?,?,?,?,?,?)",
-            (uid, name, row[0], now.isoformat(), dur, ws)
-        )
-        await db.execute("DELETE FROM active WHERE user_id = ?", (uid,))
-        await db.commit()
+        closed_sessions.append({
+            "user_id": uid,
+            "user_name": name,
+            "open_time": open_dt.isoformat(),
+            "close_time": now.isoformat(),
+            "dur_sec": dur,
+            "week_start": ws
+        })
+        del active_sessions[uid]
+
         await itx.response.send_message(f"🔴 Ponto Fechado! Duração: **{hms(dur)}**")
         asyncio.create_task(refresh_rank())
 
@@ -481,17 +456,17 @@ class DMNotifyView(discord.ui.View):
 # ──────────────────────────────────────────────────────────────
 @bot.tree.command(name="meu_ponto", description="Consulte suas horas trabalhadas nesta semana")
 async def cmd_meu_ponto(itx: discord.Interaction):
-    uid, ws = str(itx.user.id), week_monday(now_br()).isoformat()
-    sessions = await db.fetchall(
-        "SELECT open_time, close_time, dur_sec FROM sessions WHERE user_id = ? AND week_start >= ? ORDER BY open_time DESC",
-        (uid, ws)
-    )
-    active = await db.fetchone("SELECT open_time FROM active WHERE user_id = ?", (uid,))
+    uid = str(itx.user.id)
+    ws = week_monday(now_br()).isoformat()
 
-    total = sum(s[2] for s in sessions if s[2])
+    # Sessões fechadas
+    user_sessions = [s for s in closed_sessions if s["user_id"] == uid and s["week_start"] >= ws]
+    total = sum(s["dur_sec"] for s in user_sessions)
+
+    # Sessão ativa
     desc = ""
-    if active:
-        dt = BR_TZ.localize(datetime.datetime.fromisoformat(active[0]))
+    if uid in active_sessions:
+        dt = active_sessions[uid]["open_time"]
         total += (now_br() - dt).total_seconds()
         desc = f"🟢 **Em Serviço** desde `{dt.strftime('%H:%M:%S')}`\n\n"
 
@@ -515,15 +490,14 @@ async def auto_refresh():
 
 @tasks.loop(hours=1)
 async def notify_active_users():
-    actives = await db.fetchall("SELECT user_id, user_name, open_time FROM active")
-    for uid, uname, ot in actives:
+    for uid, data in active_sessions.items():
         user = bot.get_user(int(uid))
         if not user:
             continue
         try:
             embed = discord.Embed(
                 title="⏰ Verificação de Ponto",
-                description=f"Olá {uname}, você ainda está em serviço?",
+                description=f"Olá {data['name']}, você ainda está em serviço?",
                 color=0x3498DB
             )
             await user.send(embed=embed, view=DMNotifyView(int(uid)))
@@ -537,8 +511,6 @@ async def notify_active_users():
 # ──────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
-    await init_db()
-
     # Registrar views persistentes
     bot.add_view(PunchView())
     bot.add_view(RemovePanelView())
@@ -566,7 +538,7 @@ async def on_ready():
     except Exception as exc:
         logger.error(f"Erro ao sincronizar comandos: {exc}")
 
-    logger.info(f"✅ {bot.user} online!")
+    logger.info(f"✅ {bot.user} online! (Armazenamento em memória)")
 
 # ──────────────────────────────────────────────────────────────
 #  MAIN
