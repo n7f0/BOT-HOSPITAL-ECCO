@@ -5,7 +5,7 @@ services:
     container_name: bot-hospital-ecco
     restart: always
     environment:
-      - DISCORD_TOKEN=O_SEU_NOVO_TOKEN_AQUI
+      - DISCORD_TOKEN=MTUxNTg0ODgxNTQ0NDM2NTUyMw.GFRgmJ.-ypTNuNWmnmEx27hytewSnZXaHxntPlWiOFN4I
       - PANEL_CHANNEL_ID=1515846128493658142
       - RANK_CHANNEL_ID=1515852084480839850
       - LOGS_CHANNEL_ID=1515846898156834956
